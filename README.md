@@ -1,6 +1,6 @@
 # IDA Fast MCP
 
-MCP server for IDA Pro. Designed for how LLMs reason.
+MCP server for IDA Pro. Built for automated reverse engineering.
 
 [![Lint](https://github.com/Harmenszoon/ida-fast-mcp/actions/workflows/lint.yml/badge.svg)](https://github.com/Harmenszoon/ida-fast-mcp/actions/workflows/lint.yml)
 ![IDA Pro 9.x](https://img.shields.io/badge/IDA%20Pro-9.x-blue)
