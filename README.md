@@ -1,18 +1,26 @@
 # IDA Fast MCP
 
-MCP server for IDA Pro. Exposes reverse-engineering tools to AI agents via HTTP.
+MCP server for IDA Pro. Lets AI agents reverse engineer binaries.
 
 [![Lint](https://github.com/Harmenszoon/ida-fast-mcp/actions/workflows/lint.yml/badge.svg)](https://github.com/Harmenszoon/ida-fast-mcp/actions/workflows/lint.yml)
 ![IDA Pro 9.x](https://img.shields.io/badge/IDA%20Pro-9.x-blue)
 ![Python 3.12+](https://img.shields.io/badge/Python-3.12+-green)
 [![License: Unlicense](https://img.shields.io/badge/License-Unlicense-lightgrey)](LICENSE)
 
+## Why
+
+AI agents need to navigate binaries the way humans do: decompile a function, follow xrefs, rename variables, set types. This gives them that.
+
+Every line of pseudocode includes its address. The agent sees `/* 0x140001234 */ if (a1 > 5)` and can reason about exactly where things are. It can rename that variable, set its type, add a comment — all referencing precise locations.
+
+One file. Drop it in your plugins folder. No dependencies, no setup, no config files.
+
 ## Features
 
-- **Single file, zero dependencies** — stdlib + IDA modules only
-- **11 tools** — decompile, xrefs, functions, strings, imports, pattern scan, rename, type, comment
-- **Pseudocode first** — decompiles with address annotations; falls back to disassembly
-- **Stability first** — all IDA API calls on main thread with 5s timeout
+- **Address-annotated pseudocode** — every decompiled line shows its EA
+- **Stable** — all IDA API calls on main thread, 5s timeout, won't hang or crash
+- **Bounded outputs** — pagination on all list operations, no memory bombs
+- **Single file** — stdlib + IDA modules only, nothing to install
 
 ## Install
 
