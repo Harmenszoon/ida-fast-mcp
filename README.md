@@ -9,25 +9,30 @@ MCP server for IDA Pro. Designed for how LLMs reason.
 
 ## Design
 
-Context is finite. Every tool, every output, every description competes for the tokens an LLM uses to think. This server is built around that constraint.
+Context is finite. Every token an LLM spends parsing tool names, reading descriptions, or processing bloated output is a token not spent reasoning about your binary.
 
-- **11 tools** — no redundancy, no overlap
+- **11 tools** — no redundancy, no overlap, clear names like `get_function` and `list_imports`
+- **Tight tool descriptions** — unambiguous inputs and outputs, so the model picks the right tool and uses it correctly the first time
 - **Bounded outputs** — pagination on all lists, no context bombs
-- **Address-annotated pseudocode** — every line shows its EA for precise references
-- **Tight descriptions** — the model knows exactly what each tool returns
+
+Every error doubles your token cost. This server is shaped to minimize them.
 
 ## Install
 
 1. Copy `ida_fast_mcp.py` to your IDA plugins folder
-2. Restart IDA
-3. Add to your MCP client config:
-   ```json
-   "ida-fast-mcp": {
-     "url": "http://127.0.0.1:13338/mcp"
-   }
-   ```
+2. Restart IDA — server starts automatically at `http://127.0.0.1:13338/mcp`
+3. Point your MCP client at the URL
 
-No dependencies. No setup scripts. No environment configuration.
+Most clients just need the server URL in their MCP config. Example:
+```json
+{
+  "ida-fast-mcp": {
+    "url": "http://127.0.0.1:13338/mcp"
+  }
+}
+```
+
+No dependencies. No subprocess spawning. No environment setup.
 
 ## Tools
 
