@@ -1175,8 +1175,14 @@ _TOOL_DISPATCH: Dict[str, Tuple[Callable[[Dict[str, Any]], Dict[str, Any]], bool
 # Schema property templates
 _P_ADDR = {"type": "string", "description": "Address or symbol name"}
 _P_OFFSET = {"type": "integer", "default": 0, "minimum": 0}
-_P_FILTER = lambda desc: {"type": "string", "default": "", "description": desc}
-_P_LIMIT = lambda d, m: {"type": "integer", "default": d, "maximum": m, "minimum": 1}
+
+
+def _p_filter(desc: str) -> Dict[str, Any]:
+    return {"type": "string", "default": "", "description": desc}
+
+
+def _p_limit(d: int, m: int) -> Dict[str, Any]:
+    return {"type": "integer", "default": d, "maximum": m, "minimum": 1}
 
 
 def _schema(props: Dict[str, Any], required: List[str] = None) -> Dict[str, Any]:
@@ -1198,32 +1204,32 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
 
     {"name": "get_xrefs",
      "description": "Get cross-references TO an address (callers, reads, writes, etc).",
-     "inputSchema": _schema({"address": _P_ADDR, "limit": _P_LIMIT(Limits.XREFS_DEFAULT, Limits.XREFS_MAX), "offset": _P_OFFSET}, ["address"])},
+     "inputSchema": _schema({"address": _P_ADDR, "limit": _p_limit(Limits.XREFS_DEFAULT, Limits.XREFS_MAX), "offset": _P_OFFSET}, ["address"])},
 
     {"name": "list_functions",
      "description": "List functions sorted by address, with optional name filter and min size.",
-     "inputSchema": _schema({"filter": _P_FILTER("Substring match on name"), "min_size": {"type": "integer", "default": 0, "minimum": 0},
-                              "limit": _P_LIMIT(Limits.FUNCTIONS_DEFAULT, Limits.FUNCTIONS_MAX), "offset": _P_OFFSET})},
+     "inputSchema": _schema({"filter": _p_filter("Substring match on name"), "min_size": {"type": "integer", "default": 0, "minimum": 0},
+                              "limit": _p_limit(Limits.FUNCTIONS_DEFAULT, Limits.FUNCTIONS_MAX), "offset": _P_OFFSET})},
 
     {"name": "list_strings",
      "description": "List strings sorted by address, with optional content filter and minimum length.",
-     "inputSchema": _schema({"filter": _P_FILTER("Substring match on content"), "min_length": {"type": "integer", "default": 4, "minimum": 0},
-                              "limit": _P_LIMIT(Limits.STRINGS_DEFAULT, Limits.STRINGS_MAX), "offset": _P_OFFSET})},
+     "inputSchema": _schema({"filter": _p_filter("Substring match on content"), "min_length": {"type": "integer", "default": 4, "minimum": 0},
+                              "limit": _p_limit(Limits.STRINGS_DEFAULT, Limits.STRINGS_MAX), "offset": _P_OFFSET})},
 
     {"name": "list_imports",
      "description": "List imported functions with module names, sorted by address. Optionally include exported symbols.",
-     "inputSchema": _schema({"filter": _P_FILTER("Substring match on name or module"), "exports": {"type": "boolean", "default": False, "description": "Include exported symbols"},
-                              "limit": _P_LIMIT(Limits.IMPORTS_DEFAULT, Limits.IMPORTS_MAX), "offset": _P_OFFSET})},
+     "inputSchema": _schema({"filter": _p_filter("Substring match on name or module"), "exports": {"type": "boolean", "default": False, "description": "Include exported symbols"},
+                              "limit": _p_limit(Limits.IMPORTS_DEFAULT, Limits.IMPORTS_MAX), "offset": _P_OFFSET})},
 
     {"name": "get_pointer_table",
      "description": "Read consecutive pointers from a data table (vtables, jump tables, callbacks). Resolves each pointer to function/symbol if known.",
-     "inputSchema": _schema({"address": _P_ADDR, "count": _P_LIMIT(Limits.POINTER_TABLE_DEFAULT, Limits.POINTER_TABLE_MAX)}, ["address"])},
+     "inputSchema": _schema({"address": _P_ADDR, "count": _p_limit(Limits.POINTER_TABLE_DEFAULT, Limits.POINTER_TABLE_MAX)}, ["address"])},
 
     {"name": "pattern_scan",
      "description": "Search for byte pattern in binary. Returns match addresses with containing function.",
      "inputSchema": _schema({"pattern": {"type": "string", "description": "Hex bytes with ?? wildcards (e.g., '48 8B 05 ?? ?? ?? ??')"},
                               "segment": {"type": "string", "description": "Limit to segment (e.g., '.text'). See get_binary_info for names."},
-                              "limit": _P_LIMIT(Limits.PATTERN_SCAN_DEFAULT, Limits.PATTERN_SCAN_MAX), "offset": _P_OFFSET}, ["pattern"])},
+                              "limit": _p_limit(Limits.PATTERN_SCAN_DEFAULT, Limits.PATTERN_SCAN_MAX), "offset": _P_OFFSET}, ["pattern"])},
 
     {"name": "rename",
      "description": "Rename a symbol, or a local variable (requires old_name). IMPORTANT: Do not use IDA auto-generated prefixes like sub_, loc_, byte_, word_, dword_, qword_, unk_, off_, or stru_ followed by hex digits - these are reserved.",
