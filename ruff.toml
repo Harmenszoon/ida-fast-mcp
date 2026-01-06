@@ -1,0 +1,23 @@
+# Ruff configuration: https://docs.astral.sh/ruff/
+target-version = "py312"
+line-length = 120
+
+[lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "SIM",    # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by line-length)
+    "SIM108", # ternary operator (readability preference)
+]
+
+[lint.per-file-ignores]
+"ida_fast_mcp.py" = [
+    "F401",   # unused imports (IDA modules imported for availability)
+]

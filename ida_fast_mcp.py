@@ -3,7 +3,7 @@ IDA Fast MCP — single-file MCP server for IDA Pro (v4.10.0)
 
 Purpose
 -------
-Expose a minimal, stable set of reverse-engineering tools (11 tools) to
+Expose a minimal, stable set of reverse-engineering tools (14 tools) to
 high-capability AI agents via MCP (Model Context Protocol) over Streamable HTTP.
 
 Compatibility
@@ -185,6 +185,14 @@ def _require_param(args: Dict[str, Any], key: str) -> Any:
 def _get_offset(args: Dict[str, Any]) -> int:
     """Extract pagination offset from args."""
     return max(0, int(args.get("offset", 0) or 0))
+
+
+def _normalize_size(size: int) -> int:
+    """Convert BADSIZE to -1 for cleaner output."""
+    # BADSIZE is 0xFFFFFFFFFFFFFFFF or similar large values
+    if size < 0 or size > 0x7FFFFFFFFFFFFFFF:
+        return -1
+    return size
 
 
 def _paginated(key: str, items: list, offset: int, limit: int, total: int, **extra) -> Dict[str, Any]:
@@ -914,6 +922,125 @@ def _tool_set_type(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"success": True, "address": _format_ea(apply_ea), "type": type_decl}
 
 
+def _tool_define_type(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse C declaration into local type library."""
+    code = str(_require_param(args, "code")).strip()
+    if not code:
+        raise ValueError("code must be a non-empty string")
+
+    # Try parsing with idc_parse_types (handles structs, enums, typedefs)
+    # Returns number of errors (0 = success)
+    errors = ida_typeinf.idc_parse_types(code, 0)
+    if errors != 0:
+        # Fallback: try adding semicolon if missing
+        if not code.rstrip().endswith(';'):
+            errors = ida_typeinf.idc_parse_types(code + ";", 0)
+        if errors != 0:
+            raise ValueError(
+                "Failed to parse type declaration. Check C syntax. "
+                "Example: 'struct X { int a; };' or 'typedef int DWORD;'"
+            )
+
+    # Extract the defined type name for response
+    # Try multiple patterns to handle different C declaration styles
+    type_name = None
+    
+    # Pattern 1: struct/enum/union Name { ... }
+    match = re.search(r'(?:struct|enum|union)\s+(\w+)\s*\{', code)
+    if match:
+        type_name = match.group(1)
+    
+    # Pattern 2: typedef struct { ... } Name;
+    if not type_name:
+        match = re.search(r'\}\s*(\w+)\s*;', code)
+        if match:
+            type_name = match.group(1)
+    
+    # Pattern 3: typedef Type Name;
+    if not type_name:
+        match = re.search(r'typedef\s+\S+\s+(\w+)\s*;', code)
+        if match:
+            type_name = match.group(1)
+
+    result: Dict[str, Any] = {"success": True}
+    if type_name:
+        result["name"] = type_name
+        # Get size via ordinal lookup (more reliable)
+        til = ida_typeinf.get_idati()
+        ordinal = ida_typeinf.get_type_ordinal(til, type_name)
+        if ordinal:
+            tif = ida_typeinf.tinfo_t()
+            if tif.get_numbered_type(til, ordinal):
+                result["size"] = _normalize_size(tif.get_size())
+    return result
+
+
+def _tool_get_type(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Get type definition by name."""
+    name = str(_require_param(args, "name")).strip()
+    if not name:
+        raise ValueError("name must be a non-empty string")
+
+    til = ida_typeinf.get_idati()
+    ordinal = ida_typeinf.get_type_ordinal(til, name)
+    if ordinal == 0:
+        raise ValueError(f"Type '{name}' not found in local type library")
+
+    # Get the C representation using idc_get_local_type
+    # Flags: 0 = just type, PRTYPE_MULTI for multiline
+    definition = ida_typeinf.idc_get_local_type(ordinal, ida_typeinf.PRTYPE_DEF | ida_typeinf.PRTYPE_MULTI)
+    if not definition:
+        definition = ida_typeinf.idc_get_local_type(ordinal, 0) or ""
+
+    # Get size via tinfo
+    tif = ida_typeinf.tinfo_t()
+    size = -1
+    if tif.get_numbered_type(til, ordinal):
+        size = _normalize_size(tif.get_size())
+
+    return {
+        "name": name,
+        "size": size,
+        "ordinal": ordinal,
+        "definition": definition,
+    }
+
+
+def _tool_list_types(args: Dict[str, Any]) -> Dict[str, Any]:
+    """List types in local type library."""
+    filter_str = str(args.get("filter", "") or "").lower()
+    limit = _clamp_int(args.get("limit"), default=30, min_value=1, max_value=100)
+    offset = _get_offset(args)
+
+    til = ida_typeinf.get_idati()
+    if not til:
+        return _paginated("types", [], offset, limit, 0)
+
+    # Collect matching types by iterating ordinals
+    all_types: List[Dict[str, Any]] = []
+    ordinal_limit = ida_typeinf.get_ordinal_limit(til)
+    
+    for ordinal in range(1, ordinal_limit):
+        name = ida_typeinf.get_numbered_type_name(til, ordinal)
+        if not name:
+            continue
+        if filter_str and filter_str not in name.lower():
+            continue
+        tif = ida_typeinf.tinfo_t()
+        if tif.get_numbered_type(til, ordinal):
+            all_types.append({
+                "name": name,
+                "size": _normalize_size(tif.get_size()),
+                "ordinal": ordinal,
+            })
+
+    # Sort by name for consistency
+    all_types.sort(key=lambda x: x["name"].lower())
+    
+    page = all_types[offset:offset + limit]
+    return _paginated("types", page, offset, limit, len(all_types))
+
+
 # =============================================================================
 # Pattern scanning (uses IDA's native bin_search for speed)
 # =============================================================================
@@ -1155,17 +1282,24 @@ def _tool_pattern_scan(args: Dict[str, Any]) -> Dict[str, Any]:
 # =============================================================================
 
 _TOOL_DISPATCH: Dict[str, Tuple[Callable[[Dict[str, Any]], Dict[str, Any]], bool]] = {
+    # Read operations
     "get_binary_info": (_tool_get_binary_info, False),
     "get_function": (_tool_get_function, False),
     "get_xrefs": (_tool_get_xrefs, False),
+    "get_pointer_table": (_tool_get_pointer_table, False),
+    "get_type": (_tool_get_type, False),
+    # List operations
     "list_functions": (_tool_list_functions, False),
     "list_strings": (_tool_list_strings, False),
     "list_imports": (_tool_list_imports, False),
-    "get_pointer_table": (_tool_get_pointer_table, False),
-    "pattern_scan": (_tool_pattern_scan, False),
-    "rename": (_tool_rename, True),
+    "list_types": (_tool_list_types, False),
+    # Search operations
+    "find_pattern": (_tool_pattern_scan, False),
+    # Mutation operations
+    "set_name": (_tool_rename, True),
     "set_comment": (_tool_set_comment, True),
-    "set_type": (_tool_set_type, True),
+    "apply_type": (_tool_set_type, True),
+    "define_type": (_tool_define_type, True),
 }
 
 # =============================================================================
@@ -1177,8 +1311,8 @@ _P_ADDR = {"type": "string", "description": "Address or symbol name"}
 _P_OFFSET = {"type": "integer", "default": 0, "minimum": 0}
 
 
-def _p_filter(desc: str) -> Dict[str, Any]:
-    return {"type": "string", "default": "", "description": desc}
+def _p_filter(noun: str) -> Dict[str, Any]:
+    return {"type": "string", "default": "", "description": f"Substring match on {noun}"}
 
 
 def _p_limit(d: int, m: int) -> Dict[str, Any]:
@@ -1194,59 +1328,89 @@ def _schema(props: Dict[str, Any], required: List[str] = None) -> Dict[str, Any]
 
 
 TOOL_SCHEMAS: List[Dict[str, Any]] = [
+    # Read operations
     {"name": "get_binary_info",
-     "description": "Initialize session and get binary metadata + segments.",
+     "description": "Binary metadata and segment list.",
      "inputSchema": _schema({})},
 
     {"name": "get_function",
-     "description": "Get decompiled pseudocode (with addresses) for the containing function; falls back to disassembly.",
-     "inputSchema": _schema({"address": _P_ADDR, "force_disassembly": {"type": "boolean", "default": False}}, ["address"])},
+     "description": "Decompiled pseudocode for function at address. Falls back to disassembly.",
+     "inputSchema": _schema({"address": _P_ADDR, 
+                              "force_disassembly": {"type": "boolean", "default": False, "description": "Skip decompiler"}}, ["address"])},
 
     {"name": "get_xrefs",
-     "description": "Get cross-references TO an address (callers, reads, writes, etc).",
-     "inputSchema": _schema({"address": _P_ADDR, "limit": _p_limit(Limits.XREFS_DEFAULT, Limits.XREFS_MAX), "offset": _P_OFFSET}, ["address"])},
-
-    {"name": "list_functions",
-     "description": "List functions sorted by address, with optional name filter and min size.",
-     "inputSchema": _schema({"filter": _p_filter("Substring match on name"), "min_size": {"type": "integer", "default": 0, "minimum": 0},
-                              "limit": _p_limit(Limits.FUNCTIONS_DEFAULT, Limits.FUNCTIONS_MAX), "offset": _P_OFFSET})},
-
-    {"name": "list_strings",
-     "description": "List strings sorted by address, with optional content filter and minimum length.",
-     "inputSchema": _schema({"filter": _p_filter("Substring match on content"), "min_length": {"type": "integer", "default": 4, "minimum": 0},
-                              "limit": _p_limit(Limits.STRINGS_DEFAULT, Limits.STRINGS_MAX), "offset": _P_OFFSET})},
-
-    {"name": "list_imports",
-     "description": "List imported functions with module names, sorted by address. Optionally include exported symbols.",
-     "inputSchema": _schema({"filter": _p_filter("Substring match on name or module"), "exports": {"type": "boolean", "default": False, "description": "Include exported symbols"},
-                              "limit": _p_limit(Limits.IMPORTS_DEFAULT, Limits.IMPORTS_MAX), "offset": _P_OFFSET})},
+     "description": "Cross-references to address (callers, data refs).",
+     "inputSchema": _schema({"address": _P_ADDR, 
+                              "limit": _p_limit(Limits.XREFS_DEFAULT, Limits.XREFS_MAX), 
+                              "offset": _P_OFFSET}, ["address"])},
 
     {"name": "get_pointer_table",
-     "description": "Read consecutive pointers from a data table (vtables, jump tables, callbacks). Resolves each pointer to function/symbol if known.",
-     "inputSchema": _schema({"address": _P_ADDR, "count": _p_limit(Limits.POINTER_TABLE_DEFAULT, Limits.POINTER_TABLE_MAX)}, ["address"])},
+     "description": "Read pointer table (vtable, jump table). Resolves to symbols.",
+     "inputSchema": _schema({"address": _P_ADDR, 
+                              "count": _p_limit(Limits.POINTER_TABLE_DEFAULT, Limits.POINTER_TABLE_MAX)}, ["address"])},
 
-    {"name": "pattern_scan",
-     "description": "Search for byte pattern in binary. Returns match addresses with containing function.",
-     "inputSchema": _schema({"pattern": {"type": "string", "description": "Hex bytes with ?? wildcards (e.g., '48 8B 05 ?? ?? ?? ??')"},
-                              "segment": {"type": "string", "description": "Limit to segment (e.g., '.text'). See get_binary_info for names."},
-                              "limit": _p_limit(Limits.PATTERN_SCAN_DEFAULT, Limits.PATTERN_SCAN_MAX), "offset": _P_OFFSET}, ["pattern"])},
+    {"name": "get_type",
+     "description": "Type definition by name. Returns C declaration.",
+     "inputSchema": _schema({"name": {"type": "string", "description": "Type name"}}, ["name"])},
 
-    {"name": "rename",
-     "description": "Rename a symbol, or a local variable (requires old_name). IMPORTANT: Do not use IDA auto-generated prefixes like sub_, loc_, byte_, word_, dword_, qword_, unk_, off_, or stru_ followed by hex digits - these are reserved.",
-     "inputSchema": _schema({"address": {"type": "string", "description": "Target address, or function address for locals"},
-                              "new_name": {"type": "string", "description": "New name to assign (must not use reserved IDA prefixes like sub_XXXX)"},
-                              "old_name": {"type": "string", "description": "Current name (required for local variables)"}}, ["address", "new_name"])},
+    # List operations
+    {"name": "list_functions",
+     "description": "Functions by address. Filterable by name, size.",
+     "inputSchema": _schema({"filter": _p_filter("name"), 
+                              "min_size": {"type": "integer", "default": 0, "minimum": 0},
+                              "limit": _p_limit(Limits.FUNCTIONS_DEFAULT, Limits.FUNCTIONS_MAX), 
+                              "offset": _P_OFFSET})},
+
+    {"name": "list_strings",
+     "description": "Strings by address. Filterable by content, length.",
+     "inputSchema": _schema({"filter": _p_filter("content"), 
+                              "min_length": {"type": "integer", "default": 4, "minimum": 0},
+                              "limit": _p_limit(Limits.STRINGS_DEFAULT, Limits.STRINGS_MAX), 
+                              "offset": _P_OFFSET})},
+
+    {"name": "list_imports",
+     "description": "Imports by address. Use 'exports' param for exports.",
+     "inputSchema": _schema({"filter": _p_filter("name or module"), 
+                              "exports": {"type": "boolean", "default": False, "description": "Include exports"},
+                              "limit": _p_limit(Limits.IMPORTS_DEFAULT, Limits.IMPORTS_MAX), 
+                              "offset": _P_OFFSET})},
+
+    {"name": "list_types",
+     "description": "Types in local type library.",
+     "inputSchema": _schema({"filter": _p_filter("name"),
+                              "limit": _p_limit(30, 100), 
+                              "offset": _P_OFFSET})},
+
+    # Search operations
+    {"name": "find_pattern",
+     "description": "Byte pattern search. Returns matches with containing function.",
+     "inputSchema": _schema({"pattern": {"type": "string", "description": "Hex bytes, ?? wildcards (e.g., '48 8B ?? ??')"},
+                              "segment": {"type": "string", "description": "Limit to segment (e.g., '.text')"},
+                              "limit": _p_limit(Limits.PATTERN_SCAN_DEFAULT, Limits.PATTERN_SCAN_MAX), 
+                              "offset": _P_OFFSET}, ["pattern"])},
+
+    # Mutation operations
+    {"name": "set_name",
+     "description": "Rename symbol or local variable. Locals need 'old_name'. Avoid IDA prefixes (sub_, loc_, etc.).",
+     "inputSchema": _schema({"address": {"type": "string", "description": "Address, or function address for locals"},
+                              "new_name": {"type": "string", "description": "New name (no IDA prefixes like sub_XXXX)"},
+                              "old_name": {"type": "string", "description": "Current name (required for locals)"}}, ["address", "new_name"])},
 
     {"name": "set_comment",
-     "description": "Set a comment at an address (overwrites existing).",
-     "inputSchema": _schema({"address": _P_ADDR, "comment": {"type": "string", "description": "Comment text"},
-                              "repeatable": {"type": "boolean", "default": False, "description": "Show at all xref locations"}}, ["address", "comment"])},
+     "description": "Set comment at address. Overwrites existing.",
+     "inputSchema": _schema({"address": _P_ADDR, 
+                              "comment": {"type": "string", "description": "Comment text"},
+                              "repeatable": {"type": "boolean", "default": False, "description": "Show at xref locations"}}, ["address", "comment"])},
 
-    {"name": "set_type",
-     "description": "Apply a C type to an address/function prototype or a local variable.",
-     "inputSchema": _schema({"address": {"type": "string", "description": "Target address, or function address for locals"},
-                              "type": {"type": "string", "description": "C type declaration"},
-                              "variable": {"type": "string", "description": "Variable name (for local variables)"}}, ["address", "type"])},
+    {"name": "apply_type",
+     "description": "Apply type to address (data/function) or local variable.",
+     "inputSchema": _schema({"address": {"type": "string", "description": "Address, or function address for locals"},
+                              "type": {"type": "string", "description": "C type (e.g., 'int *', 'int __fastcall f(void *)')"},
+                              "variable": {"type": "string", "description": "Local variable name"}}, ["address", "type"])},
+
+    {"name": "define_type",
+     "description": "Parse C declaration into type library. Overwrites existing.",
+     "inputSchema": _schema({"code": {"type": "string", "description": "C declaration (e.g., 'struct X { int a; };')"}}, ["code"])},
 ]
 
 # Pre-computed schema lookup for O(1) access
