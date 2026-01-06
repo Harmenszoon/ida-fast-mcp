@@ -756,7 +756,6 @@ def _tool_get_pointer_table(args: dict[str, Any]) -> dict[str, Any]:
         "pointer_size": ptr_size,
         "entries": entries,
         "count": len(entries),
-        "next_offset": count if len(entries) == count else None,
     }
 
 
@@ -1266,14 +1265,10 @@ def _tool_pattern_scan(args: dict[str, Any]) -> dict[str, Any]:
     # Calculate next_offset if there are more results
     next_offset = (offset + limit) if has_more else None
 
-    # Total: we fetched offset+limit+1, so if has_more is true, we don't know the real total
-    # Report what we know: the count up to offset+limit (excluding the +1 probe)
-    total = offset + len(page)
-
     return {
         "matches": results,
         "count": len(results),
-        "total": total,
+        "has_more": has_more,
         "next_offset": next_offset,
     }
 
