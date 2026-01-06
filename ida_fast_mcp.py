@@ -42,34 +42,36 @@ Note: This is a local, single-user tool. Host is restricted to localhost/127.0.0
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import queue
 import re
 import threading
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any
 
-# IDA modules (no third-party deps)
-import idaapi
 import ida_bytes
 import ida_entry
 import ida_funcs
+import ida_hexrays
 import ida_ida
 import ida_kernwin
 import ida_lines
-import ida_name
 import ida_nalt
+import ida_name
 import ida_segment
 import ida_strlist
 import ida_typeinf
 import ida_xref
+
+# IDA modules (no third-party deps)
+import idaapi
 import idautils
 import idc
-import ida_hexrays
-
 
 # =============================================================================
 # Configuration & limits (design reference)
@@ -131,8 +133,8 @@ class Limits:
 class _State:
     tool_lock: threading.Lock = field(default_factory=threading.Lock)
 
-    http_server: Optional[ThreadingHTTPServer] = None
-    server_thread: Optional[threading.Thread] = None
+    http_server: ThreadingHTTPServer | None = None
+    server_thread: threading.Thread | None = None
 
 
 _state = _State()
@@ -172,7 +174,7 @@ def _is_hex(s: str) -> bool:
     return bool(_HEX_RE.match(s.strip()))
 
 
-def _require_param(args: Dict[str, Any], key: str) -> Any:
+def _require_param(args: dict[str, Any], key: str) -> Any:
     """Extract a required parameter, raising ValueError if missing or null."""
     if key not in args:
         raise ValueError(f"Missing required parameter: '{key}'")
@@ -182,7 +184,7 @@ def _require_param(args: Dict[str, Any], key: str) -> Any:
     return val
 
 
-def _get_offset(args: Dict[str, Any]) -> int:
+def _get_offset(args: dict[str, Any]) -> int:
     """Extract pagination offset from args."""
     return max(0, int(args.get("offset", 0) or 0))
 
@@ -195,7 +197,7 @@ def _normalize_size(size: int) -> int:
     return size
 
 
-def _paginated(key: str, items: list, offset: int, limit: int, total: int, **extra) -> Dict[str, Any]:
+def _paginated(key: str, items: list, offset: int, limit: int, total: int, **extra) -> dict[str, Any]:
     """Build a paginated response dict."""
     result = {
         key: items,
@@ -214,7 +216,7 @@ def _paginated(key: str, items: list, offset: int, limit: int, total: int, **ext
 def _ida_execute(fn: Callable[[], Any], *, write: bool) -> Any:
     """Run fn on IDA's main thread via execute_sync."""
     result: Any = None
-    exception: Optional[BaseException] = None
+    exception: BaseException | None = None
 
     def _wrapper() -> None:
         nonlocal result, exception
@@ -234,7 +236,7 @@ def _ida_execute(fn: Callable[[], Any], *, write: bool) -> Any:
 # Hex-Rays helpers
 # =============================================================================
 
-def _get_line_ea(cfunc: Any, line_str: str) -> Optional[int]:
+def _get_line_ea(cfunc: Any, line_str: str) -> int | None:
     """Extract EA for a pseudocode line via get_line_item()."""
     if not line_str:
         return None
@@ -257,15 +259,15 @@ def _get_pseudocode_with_addresses(cfunc: Any) -> str:
     """Generate pseudocode with per-line address annotations."""
     func_entry_ea = cfunc.entry_ea
     sv = cfunc.get_pseudocode()
-    out_lines: List[str] = []
+    out_lines: list[str] = []
 
     for i, sl in enumerate(sv):
         if i >= Limits.CODE_LINES_MAX:
             break
-        
+
         ea = func_entry_ea if i == 0 else _get_line_ea(cfunc, sl.line)
         text = ida_lines.tag_remove(sl.line).rstrip()
-        
+
         if ea is not None:
             out_lines.append(f"/* {_format_ea(ea)} */ {text}")
         else:
@@ -313,8 +315,8 @@ def _parse_address(value: Any) -> int:
 # =============================================================================
 
 # Best-effort string type classification
-_STRING_UNICODE_TYPES: Set[int] = set()
-_STRING_PASCAL_TYPES: Set[int] = set()
+_STRING_UNICODE_TYPES: set[int] = set()
+_STRING_PASCAL_TYPES: set[int] = set()
 
 for _mod in (ida_nalt, idc):
     for _attr in ("STRTYPE_C_16", "STRTYPE_C_32", "STRTYPE_UNICODE"):
@@ -337,11 +339,11 @@ def _classify_string_type(strtype: int) -> str:
     return "ascii"
 
 
-def _iter_strings() -> Iterable[Dict[str, Any]]:
+def _iter_strings() -> Iterable[dict[str, Any]]:
     """Iterate over strings using IDA's indexed access."""
     qty = ida_strlist.get_strlist_qty()
     si = ida_strlist.string_info_t()
-    
+
     for i in range(qty):
         if not ida_strlist.get_strlist_item(si, i):
             continue
@@ -360,24 +362,24 @@ def _iter_strings() -> Iterable[Dict[str, Any]]:
         }
 
 
-def _iter_imports() -> Iterable[Dict[str, Any]]:
+def _iter_imports() -> Iterable[dict[str, Any]]:
     """Iterate over imports by module."""
     qty = ida_nalt.get_import_module_qty()
 
     for i in range(qty):
         module_name = ida_nalt.get_import_module_name(i) or ""
-        collected: List[Dict[str, Any]] = []
+        collected: list[dict[str, Any]] = []
 
-        def _cb(ea: int, name: Optional[str], ordinal: int) -> bool:
+        def _cb(ea: int, name: str | None, ordinal: int, *, _collected: list = collected, _module: str = module_name) -> bool:
             nm = (name or "").strip() or f"ord_{ordinal}"
-            collected.append({"address": ea, "name": nm, "module": module_name})
+            _collected.append({"address": ea, "name": nm, "module": _module})
             return True
 
         ida_nalt.enum_import_names(i, _cb)
         yield from collected
 
 
-def _iter_exports() -> Iterable[Dict[str, Any]]:
+def _iter_exports() -> Iterable[dict[str, Any]]:
     """Iterate over exports using IDA's indexed access."""
     qty = ida_entry.get_entry_qty()
 
@@ -395,7 +397,7 @@ def _iter_exports() -> Iterable[Dict[str, Any]]:
 # Xref type categorization using IDA's xref type constants
 # =============================================================================
 
-_XREF_TYPE_MAP: Dict[int, str] = {
+_XREF_TYPE_MAP: dict[int, str] = {
     # Code xrefs
     ida_xref.fl_CF: "call", ida_xref.fl_CN: "call",  # far/near call
     ida_xref.fl_JF: "jump", ida_xref.fl_JN: "jump",  # far/near jump
@@ -416,7 +418,7 @@ def _categorize_xref_type(xref_type: int) -> str:
 # Tool implementations (11 tools)
 # =============================================================================
 
-def _tool_get_binary_info(_args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_get_binary_info(_args: dict[str, Any]) -> dict[str, Any]:
     """Get binary metadata including file info, architecture, and segments."""
     # File identity
     name = ida_nalt.get_root_filename() or ""
@@ -425,15 +427,14 @@ def _tool_get_binary_info(_args: Dict[str, Any]) -> Dict[str, Any]:
 
     # Entrypoint - inf_get_start_ip is authoritative in IDA 9.x
     entry = ida_ida.inf_get_start_ip()
-    if entry == idaapi.BADADDR:
+    if entry == idaapi.BADADDR and ida_entry.get_entry_qty() > 0:
         # Fallback to first entry point
-        if ida_entry.get_entry_qty() > 0:
-            entry = ida_entry.get_entry(ida_entry.get_entry_ordinal(0))
+        entry = ida_entry.get_entry(ida_entry.get_entry_ordinal(0))
 
     # Bitness / architecture
     bitness = 64 if ida_ida.inf_is_64bit() else (32 if ida_ida.inf_is_32bit() else 16)
     proc = ida_ida.inf_get_procname() or ""
-    
+
     proc_l = proc.lower()
     if proc_l in ("metapc", "pc", "8086"):
         architecture = "x64" if bitness == 64 else ("x86" if bitness == 32 else f"x86_{bitness}")
@@ -463,19 +464,19 @@ def _tool_get_binary_info(_args: Dict[str, Any]) -> Dict[str, Any]:
         file_type = ft.strip()[:32] if ft else ""
 
     # Segments - using indexed access
-    segments: List[Dict[str, Any]] = []
+    segments: list[dict[str, Any]] = []
     for i in range(ida_segment.get_segm_qty()):
         seg = ida_segment.getnseg(i)
         if not seg:
             continue
-        
+
         perm = seg.perm
         perms = "".join([
             "r" if perm & ida_segment.SEGPERM_READ else "-",
             "w" if perm & ida_segment.SEGPERM_WRITE else "-",
             "x" if perm & ida_segment.SEGPERM_EXEC else "-",
         ])
-        
+
         segments.append({
             "name": ida_segment.get_segm_name(seg) or "",
             "start": _format_ea(seg.start_ea),
@@ -502,7 +503,7 @@ def _build_disassembly(func: Any) -> str:
     end = func.end_ea
     name = ida_name.get_name(start) or f"sub_{start:x}"
 
-    out: List[str] = [f"/* {_format_ea(start)} */ {name} proc"]
+    out: list[str] = [f"/* {_format_ea(start)} */ {name} proc"]
     ea = start
     lines_emitted = 0
 
@@ -521,7 +522,7 @@ def _build_disassembly(func: Any) -> str:
     return "\n".join(out)
 
 
-def _tool_get_function(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_get_function(args: dict[str, Any]) -> dict[str, Any]:
     ea = _parse_address(_require_param(args, "address"))
     force_disasm = bool(args.get("force_disassembly", False))
 
@@ -544,7 +545,7 @@ def _tool_get_function(args: Dict[str, Any]) -> Dict[str, Any]:
 
     # Attempt decompilation with failure info
     cfunc = None
-    failure_desc: Optional[str] = None
+    failure_desc: str | None = None
 
     try:
         failure = ida_hexrays.hexrays_failure_t()
@@ -565,34 +566,34 @@ def _tool_get_function(args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _tool_get_xrefs(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_get_xrefs(args: dict[str, Any]) -> dict[str, Any]:
     ea = _parse_address(_require_param(args, "address"))
     limit = _clamp_int(args.get("limit"), default=Limits.XREFS_DEFAULT, min_value=1, max_value=Limits.XREFS_MAX)
     offset = _get_offset(args)
 
     # Collect all xrefs, then sort and paginate
-    xrefs_list: List[Tuple[int, Dict[str, Any]]] = []
-    
+    xrefs_list: list[tuple[int, dict[str, Any]]] = []
+
     for xref in idautils.XrefsTo(ea):
         from_ea = xref.frm
         cat = _categorize_xref_type(xref.type)
-        
+
         from_func = ida_funcs.get_func(from_ea)
         if from_func:
             fn = ida_name.get_name(from_func.start_ea) or _format_ea(from_func.start_ea)
             obj = {"from_address": _format_ea(from_ea), "from_function": fn, "type": cat}
         else:
             obj = {"from_address": _format_ea(from_ea), "from_function": None, "type": cat}
-        
+
         xrefs_list.append((from_ea, obj))
-    
+
     # Sort by address
     xrefs_list.sort(key=lambda x: x[0])
     total = len(xrefs_list)
-    
+
     # Paginate
     page = [obj for _, obj in xrefs_list[offset:offset + limit]]
-    
+
     return {
         "address": _format_ea(ea),
         "xrefs": page,
@@ -602,14 +603,14 @@ def _tool_get_xrefs(args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _tool_list_functions(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_list_functions(args: dict[str, Any]) -> dict[str, Any]:
     name_filter = str(args.get("filter", "") or "").lower()
     min_size = max(0, int(args.get("min_size", 0) or 0))
     limit = _clamp_int(args.get("limit"), default=Limits.FUNCTIONS_DEFAULT, min_value=1, max_value=Limits.FUNCTIONS_MAX)
     offset = _get_offset(args)
 
     # idautils.Functions() returns addresses in sorted order
-    all_funcs: List[Tuple[int, str, int]] = []
+    all_funcs: list[tuple[int, str, int]] = []
     for fea in idautils.Functions():
         f = ida_funcs.get_func(fea)
         if not f:
@@ -630,13 +631,13 @@ def _tool_list_functions(args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
-def _tool_list_strings(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_list_strings(args: dict[str, Any]) -> dict[str, Any]:
     content_filter = str(args.get("filter", "") or "").lower()
     min_length = max(0, int(args.get("min_length", 4) or 4))
     limit = _clamp_int(args.get("limit"), default=Limits.STRINGS_DEFAULT, min_value=1, max_value=Limits.STRINGS_MAX)
     offset = _get_offset(args)
 
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     total = 0
     for s in _iter_strings():
         if s["length"] < min_length:
@@ -651,14 +652,14 @@ def _tool_list_strings(args: Dict[str, Any]) -> Dict[str, Any]:
     return _paginated("strings", out, offset, limit, total)
 
 
-def _tool_list_imports(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_list_imports(args: dict[str, Any]) -> dict[str, Any]:
     """List imports and/or exports with optional filtering."""
     name_filter = str(args.get("filter", "") or "").lower()
     limit = _clamp_int(args.get("limit"), default=Limits.IMPORTS_DEFAULT, min_value=1, max_value=Limits.IMPORTS_MAX)
     offset = _get_offset(args)
     include_exports = bool(args.get("exports", False))
 
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     total = 0
 
     for imp in _iter_imports():
@@ -685,7 +686,7 @@ def _tool_list_imports(args: Dict[str, Any]) -> Dict[str, Any]:
     return _paginated("imports", out, offset, limit, total)
 
 
-def _tool_get_pointer_table(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_get_pointer_table(args: dict[str, Any]) -> dict[str, Any]:
     """Read consecutive pointers from a data table and resolve targets."""
     ea = _parse_address(_require_param(args, "address"))
     count = _clamp_int(
@@ -704,7 +705,7 @@ def _tool_get_pointer_table(args: Dict[str, Any]) -> Dict[str, Any]:
     ptr_size = 8 if ida_ida.inf_is_64bit() else 4
     read_fn = ida_bytes.get_qword if ptr_size == 8 else ida_bytes.get_dword
 
-    entries: List[Dict[str, Any]] = []
+    entries: list[dict[str, Any]] = []
 
     for i in range(count):
         slot_ea = ea + (i * ptr_size)
@@ -718,7 +719,7 @@ def _tool_get_pointer_table(args: Dict[str, Any]) -> Dict[str, Any]:
         # Format raw pointer value (get_qword/get_dword return unsigned)
         raw_str = "BADADDR" if ptr == idaapi.BADADDR else f"0x{ptr:x}"
 
-        entry: Dict[str, Any] = {
+        entry: dict[str, Any] = {
             "index": i,
             "offset": i * ptr_size,
             "slot": _format_ea(slot_ea),
@@ -759,7 +760,7 @@ def _tool_get_pointer_table(args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _get_available_local_vars(func_ea: int) -> List[str]:
+def _get_available_local_vars(func_ea: int) -> list[str]:
     """Get list of local variable names from a decompiled function."""
     try:
         cfunc = ida_hexrays.decompile(func_ea)
@@ -770,7 +771,7 @@ def _get_available_local_vars(func_ea: int) -> List[str]:
         return []
 
 
-def _tool_rename(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_rename(args: dict[str, Any]) -> dict[str, Any]:
     ea = _parse_address(_require_param(args, "address"))
     new_name = str(_require_param(args, "new_name")).strip()
     old_name = args.get("old_name")
@@ -832,7 +833,7 @@ def _tool_rename(args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _tool_set_comment(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_set_comment(args: dict[str, Any]) -> dict[str, Any]:
     ea = _parse_address(_require_param(args, "address"))
     comment = str(_require_param(args, "comment"))
     repeatable = bool(args.get("repeatable", False))
@@ -846,7 +847,7 @@ def _tool_set_comment(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"success": True, "address": _format_ea(ea)}
 
 
-def _tool_set_type(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_set_type(args: dict[str, Any]) -> dict[str, Any]:
     ea = _parse_address(_require_param(args, "address"))
     type_decl = str(_require_param(args, "type")).strip()
     variable = args.get("variable")
@@ -878,7 +879,7 @@ def _tool_set_type(args: Dict[str, Any]) -> Dict[str, Any]:
         # Use PT_TYP for abstract types (no variable name), PT_SIL to silence errors
         parse_flags = ida_typeinf.PT_SIL | ida_typeinf.PT_TYP
         tif = ida_typeinf.tinfo_t()
-        
+
         # Try parsing the type declaration
         result = ida_typeinf.parse_decl(tif, None, type_decl, parse_flags)
         parsed = result is not None and tif.is_correct()
@@ -922,7 +923,7 @@ def _tool_set_type(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"success": True, "address": _format_ea(apply_ea), "type": type_decl}
 
 
-def _tool_define_type(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_define_type(args: dict[str, Any]) -> dict[str, Any]:
     """Parse C declaration into local type library."""
     code = str(_require_param(args, "code")).strip()
     if not code:
@@ -944,25 +945,25 @@ def _tool_define_type(args: Dict[str, Any]) -> Dict[str, Any]:
     # Extract the defined type name for response
     # Try multiple patterns to handle different C declaration styles
     type_name = None
-    
+
     # Pattern 1: struct/enum/union Name { ... }
     match = re.search(r'(?:struct|enum|union)\s+(\w+)\s*\{', code)
     if match:
         type_name = match.group(1)
-    
+
     # Pattern 2: typedef struct { ... } Name;
     if not type_name:
         match = re.search(r'\}\s*(\w+)\s*;', code)
         if match:
             type_name = match.group(1)
-    
+
     # Pattern 3: typedef Type Name;
     if not type_name:
         match = re.search(r'typedef\s+\S+\s+(\w+)\s*;', code)
         if match:
             type_name = match.group(1)
 
-    result: Dict[str, Any] = {"success": True}
+    result: dict[str, Any] = {"success": True}
     if type_name:
         result["name"] = type_name
         # Get size via ordinal lookup (more reliable)
@@ -975,7 +976,7 @@ def _tool_define_type(args: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def _tool_get_type(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_get_type(args: dict[str, Any]) -> dict[str, Any]:
     """Get type definition by name."""
     name = str(_require_param(args, "name")).strip()
     if not name:
@@ -1006,7 +1007,7 @@ def _tool_get_type(args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _tool_list_types(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_list_types(args: dict[str, Any]) -> dict[str, Any]:
     """List types in local type library."""
     filter_str = str(args.get("filter", "") or "").lower()
     limit = _clamp_int(args.get("limit"), default=30, min_value=1, max_value=100)
@@ -1017,9 +1018,9 @@ def _tool_list_types(args: Dict[str, Any]) -> Dict[str, Any]:
         return _paginated("types", [], offset, limit, 0)
 
     # Collect matching types by iterating ordinals
-    all_types: List[Dict[str, Any]] = []
+    all_types: list[dict[str, Any]] = []
     ordinal_limit = ida_typeinf.get_ordinal_limit(til)
-    
+
     for ordinal in range(1, ordinal_limit):
         name = ida_typeinf.get_numbered_type_name(til, ordinal)
         if not name:
@@ -1036,7 +1037,7 @@ def _tool_list_types(args: Dict[str, Any]) -> Dict[str, Any]:
 
     # Sort by name for consistency
     all_types.sort(key=lambda x: x["name"].lower())
-    
+
     page = all_types[offset:offset + limit]
     return _paginated("types", page, offset, limit, len(all_types))
 
@@ -1058,7 +1059,7 @@ def _convert_pattern_to_ida_format(pattern_str: str) -> str:
     if not parts:
         raise ValueError("Empty pattern")
 
-    ida_parts: List[str] = []
+    ida_parts: list[str] = []
     has_concrete = False
 
     for part in parts:
@@ -1091,14 +1092,14 @@ def _convert_pattern_to_ida_format(pattern_str: str) -> str:
     return " ".join(ida_parts)
 
 
-def _get_segment_bounds(segment_name: Optional[str]) -> List[Tuple[int, int]]:
+def _get_segment_bounds(segment_name: str | None) -> list[tuple[int, int]]:
     """
     Return list of (start, end) tuples to search, sorted by start address.
     If segment_name is None, return all segments.
     Segment matching is case-insensitive, dot-optional.
     """
-    bounds: List[Tuple[int, int]] = []
-    available: List[str] = []
+    bounds: list[tuple[int, int]] = []
+    available: list[str] = []
     target = segment_name.lstrip('.').lower() if segment_name else None
 
     for i in range(ida_segment.get_segm_qty()):
@@ -1125,7 +1126,7 @@ def _get_segment_bounds(segment_name: Optional[str]) -> List[Tuple[int, int]]:
     return bounds
 
 
-def _compile_pattern(ida_pattern: str, start_ea: int) -> "ida_bytes.compiled_binpat_vec_t":
+def _compile_pattern(ida_pattern: str, start_ea: int) -> ida_bytes.compiled_binpat_vec_t:
     """
     Compile a pattern string into IDA's binary format for searching.
 
@@ -1154,18 +1155,18 @@ def _compile_pattern(ida_pattern: str, start_ea: int) -> "ida_bytes.compiled_bin
 
 
 def _bin_search_all(
-    compiled: "ida_bytes.compiled_binpat_vec_t",
+    compiled: ida_bytes.compiled_binpat_vec_t,
     start_ea: int,
     end_ea: int,
     max_results: int,
-) -> List[int]:
+) -> list[int]:
     """
     Search for all matches of a compiled pattern in a range.
 
     Uses IDA's native bin_search() for speed.
     Returns list of match addresses, up to max_results.
     """
-    matches: List[int] = []
+    matches: list[int] = []
     ea = start_ea
 
     while len(matches) < max_results:
@@ -1189,7 +1190,7 @@ def _bin_search_all(
     return matches
 
 
-def _tool_pattern_scan(args: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_pattern_scan(args: dict[str, Any]) -> dict[str, Any]:
     """Search for byte pattern in binary using IDA's native bin_search."""
     pattern_str = str(_require_param(args, "pattern"))
     segment = args.get("segment")
@@ -1204,7 +1205,7 @@ def _tool_pattern_scan(args: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError(
             f"Cannot parse pattern '{pattern_str}'. {msg}. "
             f"Example: '48 8B 05 ?? ?? ?? ??'"
-        )
+        ) from e
 
     # Resolve segment bounds
     bounds = _get_segment_bounds(segment)
@@ -1224,7 +1225,7 @@ def _tool_pattern_scan(args: Dict[str, Any]) -> Dict[str, Any]:
     # The +1 lets us detect if there are additional results beyond this page
     max_needed = offset + limit + 1
 
-    all_matches: List[int] = []
+    all_matches: list[int] = []
 
     # Search all segments, collecting results
     for start_ea, end_ea in bounds:
@@ -1246,7 +1247,7 @@ def _tool_pattern_scan(args: Dict[str, Any]) -> Dict[str, Any]:
     page = all_matches[offset:offset + limit]
 
     # Resolve function names for matches in page
-    results: List[Dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
     for ea in page:
         func = ida_funcs.get_func(ea)
         if func:
@@ -1281,7 +1282,7 @@ def _tool_pattern_scan(args: Dict[str, Any]) -> Dict[str, Any]:
 # Tool registry (schemas + dispatch)
 # =============================================================================
 
-_TOOL_DISPATCH: Dict[str, Tuple[Callable[[Dict[str, Any]], Dict[str, Any]], bool]] = {
+_TOOL_DISPATCH: dict[str, tuple[Callable[[dict[str, Any]], dict[str, Any]], bool]] = {
     # Read operations
     "get_binary_info": (_tool_get_binary_info, False),
     "get_function": (_tool_get_function, False),
@@ -1311,23 +1312,23 @@ _P_ADDR = {"type": "string", "description": "Address or symbol name"}
 _P_OFFSET = {"type": "integer", "default": 0, "minimum": 0}
 
 
-def _p_filter(noun: str) -> Dict[str, Any]:
+def _p_filter(noun: str) -> dict[str, Any]:
     return {"type": "string", "default": "", "description": f"Substring match on {noun}"}
 
 
-def _p_limit(d: int, m: int) -> Dict[str, Any]:
+def _p_limit(d: int, m: int) -> dict[str, Any]:
     return {"type": "integer", "default": d, "maximum": m, "minimum": 1}
 
 
-def _schema(props: Dict[str, Any], required: List[str] = None) -> Dict[str, Any]:
+def _schema(props: dict[str, Any], required: list[str] = None) -> dict[str, Any]:
     """Build an inputSchema dict with additionalProperties: false."""
-    s: Dict[str, Any] = {"type": "object", "properties": props, "additionalProperties": False}
+    s: dict[str, Any] = {"type": "object", "properties": props, "additionalProperties": False}
     if required:
         s["required"] = required
     return s
 
 
-TOOL_SCHEMAS: List[Dict[str, Any]] = [
+TOOL_SCHEMAS: list[dict[str, Any]] = [
     # Read operations
     {"name": "get_binary_info",
      "description": "Binary metadata and segment list.",
@@ -1335,18 +1336,18 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
 
     {"name": "get_function",
      "description": "Decompiled pseudocode for function at address. Falls back to disassembly.",
-     "inputSchema": _schema({"address": _P_ADDR, 
+     "inputSchema": _schema({"address": _P_ADDR,
                               "force_disassembly": {"type": "boolean", "default": False, "description": "Skip decompiler"}}, ["address"])},
 
     {"name": "get_xrefs",
      "description": "Cross-references to address (callers, data refs).",
-     "inputSchema": _schema({"address": _P_ADDR, 
-                              "limit": _p_limit(Limits.XREFS_DEFAULT, Limits.XREFS_MAX), 
+     "inputSchema": _schema({"address": _P_ADDR,
+                              "limit": _p_limit(Limits.XREFS_DEFAULT, Limits.XREFS_MAX),
                               "offset": _P_OFFSET}, ["address"])},
 
     {"name": "get_pointer_table",
      "description": "Read pointer table (vtable, jump table). Resolves to symbols.",
-     "inputSchema": _schema({"address": _P_ADDR, 
+     "inputSchema": _schema({"address": _P_ADDR,
                               "count": _p_limit(Limits.POINTER_TABLE_DEFAULT, Limits.POINTER_TABLE_MAX)}, ["address"])},
 
     {"name": "get_type",
@@ -1356,29 +1357,29 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
     # List operations
     {"name": "list_functions",
      "description": "Functions by address. Filterable by name, size.",
-     "inputSchema": _schema({"filter": _p_filter("name"), 
+     "inputSchema": _schema({"filter": _p_filter("name"),
                               "min_size": {"type": "integer", "default": 0, "minimum": 0},
-                              "limit": _p_limit(Limits.FUNCTIONS_DEFAULT, Limits.FUNCTIONS_MAX), 
+                              "limit": _p_limit(Limits.FUNCTIONS_DEFAULT, Limits.FUNCTIONS_MAX),
                               "offset": _P_OFFSET})},
 
     {"name": "list_strings",
      "description": "Strings by address. Filterable by content, length.",
-     "inputSchema": _schema({"filter": _p_filter("content"), 
+     "inputSchema": _schema({"filter": _p_filter("content"),
                               "min_length": {"type": "integer", "default": 4, "minimum": 0},
-                              "limit": _p_limit(Limits.STRINGS_DEFAULT, Limits.STRINGS_MAX), 
+                              "limit": _p_limit(Limits.STRINGS_DEFAULT, Limits.STRINGS_MAX),
                               "offset": _P_OFFSET})},
 
     {"name": "list_imports",
      "description": "Imports by address. Use 'exports' param for exports.",
-     "inputSchema": _schema({"filter": _p_filter("name or module"), 
+     "inputSchema": _schema({"filter": _p_filter("name or module"),
                               "exports": {"type": "boolean", "default": False, "description": "Include exports"},
-                              "limit": _p_limit(Limits.IMPORTS_DEFAULT, Limits.IMPORTS_MAX), 
+                              "limit": _p_limit(Limits.IMPORTS_DEFAULT, Limits.IMPORTS_MAX),
                               "offset": _P_OFFSET})},
 
     {"name": "list_types",
      "description": "Types in local type library.",
      "inputSchema": _schema({"filter": _p_filter("name"),
-                              "limit": _p_limit(30, 100), 
+                              "limit": _p_limit(30, 100),
                               "offset": _P_OFFSET})},
 
     # Search operations
@@ -1386,7 +1387,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
      "description": "Byte pattern search. Returns matches with containing function.",
      "inputSchema": _schema({"pattern": {"type": "string", "description": "Hex bytes, ?? wildcards (e.g., '48 8B ?? ??')"},
                               "segment": {"type": "string", "description": "Limit to segment (e.g., '.text')"},
-                              "limit": _p_limit(Limits.PATTERN_SCAN_DEFAULT, Limits.PATTERN_SCAN_MAX), 
+                              "limit": _p_limit(Limits.PATTERN_SCAN_DEFAULT, Limits.PATTERN_SCAN_MAX),
                               "offset": _P_OFFSET}, ["pattern"])},
 
     # Mutation operations
@@ -1398,7 +1399,7 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
 
     {"name": "set_comment",
      "description": "Set comment at address. Overwrites existing.",
-     "inputSchema": _schema({"address": _P_ADDR, 
+     "inputSchema": _schema({"address": _P_ADDR,
                               "comment": {"type": "string", "description": "Comment text"},
                               "repeatable": {"type": "boolean", "default": False, "description": "Show at xref locations"}}, ["address", "comment"])},
 
@@ -1414,14 +1415,14 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
 ]
 
 # Pre-computed schema lookup for O(1) access
-_TOOL_SCHEMA_MAP: Dict[str, Dict[str, Any]] = {s["name"]: s["inputSchema"] for s in TOOL_SCHEMAS}
+_TOOL_SCHEMA_MAP: dict[str, dict[str, Any]] = {s["name"]: s["inputSchema"] for s in TOOL_SCHEMAS}
 
 
 # =============================================================================
 # MCP result formatting
 # =============================================================================
 
-def _tool_success(data: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_success(data: dict[str, Any]) -> dict[str, Any]:
     # MCP: include both 'content' (text) and 'structuredContent' (machine-readable)
     return {
         "content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
@@ -1430,7 +1431,7 @@ def _tool_success(data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _tool_error(message: str) -> Dict[str, Any]:
+def _tool_error(message: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": message}], "isError": True}
 
 
@@ -1446,18 +1447,18 @@ class JsonRpcError:
     INTERNAL_ERROR = -32603
 
 
-def _jsonrpc_error(req_id: Any, code: int, message: str, data: Any = None) -> Dict[str, Any]:
-    err: Dict[str, Any] = {"code": code, "message": message}
+def _jsonrpc_error(req_id: Any, code: int, message: str, data: Any = None) -> dict[str, Any]:
+    err: dict[str, Any] = {"code": code, "message": message}
     if data is not None:
         err["data"] = data
     return {"jsonrpc": "2.0", "id": req_id, "error": err}
 
 
-def _jsonrpc_result(req_id: Any, result: Any) -> Dict[str, Any]:
+def _jsonrpc_result(req_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
 
-def _validate_tool_args(tool_name: str, arguments: Dict[str, Any]) -> None:
+def _validate_tool_args(tool_name: str, arguments: dict[str, Any]) -> None:
     """Enforce 'additionalProperties: false' and validate required params at runtime."""
     schema = _TOOL_SCHEMA_MAP.get(tool_name)
     if not schema:
@@ -1477,7 +1478,7 @@ def _validate_tool_args(tool_name: str, arguments: Dict[str, Any]) -> None:
         raise ValueError(f"Missing required argument(s) for {tool_name}: {', '.join(sorted(missing))}")
 
 
-def _handle_initialize(params: Dict[str, Any]) -> Dict[str, Any]:
+def _handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
     # MCP 2025 streamable HTTP: initialize handshake
     proto = params.get("protocolVersion") or "2025-03-26"
     return {
@@ -1487,14 +1488,14 @@ def _handle_initialize(params: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _handle_tools_list(_params: Dict[str, Any]) -> Dict[str, Any]:
+def _handle_tools_list(_params: dict[str, Any]) -> dict[str, Any]:
     return {"tools": TOOL_SCHEMAS}
 
 
-def _handle_tools_call(params: Dict[str, Any]) -> Dict[str, Any]:
+def _handle_tools_call(params: dict[str, Any]) -> dict[str, Any]:
     tool_name = params.get("name") or ""
     arguments = params.get("arguments") or {}
-    
+
     if not tool_name:
         raise ValueError("Missing tool name")
     if not isinstance(arguments, dict):
@@ -1506,17 +1507,17 @@ def _handle_tools_call(params: Dict[str, Any]) -> Dict[str, Any]:
     return _execute_tool(tool_name, arguments)
 
 
-def _handle_resources_list(_params: Dict[str, Any]) -> Dict[str, Any]:
+def _handle_resources_list(_params: dict[str, Any]) -> dict[str, Any]:
     # Out of scope for v1
     return {"resources": []}
 
 
-def _handle_prompts_list(_params: Dict[str, Any]) -> Dict[str, Any]:
+def _handle_prompts_list(_params: dict[str, Any]) -> dict[str, Any]:
     # Out of scope
     return {"prompts": []}
 
 
-def _handle_jsonrpc_request(payload: Any) -> Optional[Dict[str, Any]]:
+def _handle_jsonrpc_request(payload: Any) -> dict[str, Any] | None:
     # Notifications: id absent => no response
     req_id = payload.get("id") if isinstance(payload, dict) else None
     is_notification = isinstance(payload, dict) and ("id" not in payload)
@@ -1571,10 +1572,10 @@ def _handle_jsonrpc_request(payload: Any) -> Optional[Dict[str, Any]]:
 # Tool execution wrapper (queued execution with timeout budget)
 # =============================================================================
 
-def _execute_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+def _execute_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """
     Execute a tool with proper queuing for parallel requests.
-    
+
     Parallel requests are queued via a blocking lock with timeout. The total
     time budget (TOTAL_TIMEOUT_SECONDS) is shared between waiting for the lock
     and actual execution. This ensures:
@@ -1583,7 +1584,7 @@ def _execute_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     - IDA API calls remain serialized for stability
     """
     tool_fn, requires_write = _TOOL_DISPATCH[tool_name]
-    
+
     # Track total time budget
     start_time = _now()
     deadline = start_time + TOTAL_TIMEOUT_SECONDS
@@ -1592,7 +1593,7 @@ def _execute_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     # This queues parallel requests instead of rejecting them immediately
     lock_wait = min(LOCK_WAIT_TIMEOUT_SECONDS, TOTAL_TIMEOUT_SECONDS - MIN_EXECUTION_HEADROOM)
     lock_acquired = _state.tool_lock.acquire(blocking=True, timeout=lock_wait)
-    
+
     if not lock_acquired:
         elapsed = _now() - start_time
         return _tool_error(
@@ -1606,7 +1607,7 @@ def _execute_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         _state.tool_lock.release()
         return _tool_error("Request timed out waiting for lock — no time left for execution.")
 
-    result_queue: "queue.Queue[Tuple[bool, Any]]" = queue.Queue(maxsize=1)
+    result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
 
     def worker() -> None:
         try:
@@ -1754,7 +1755,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 # Server lifecycle (embedded in IDA)
 # =============================================================================
 
-def _parse_configuration() -> Tuple[str, int]:
+def _parse_configuration() -> tuple[str, int]:
     host = os.environ.get("IDA_FAST_MCP_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST
     port_str = os.environ.get("IDA_FAST_MCP_PORT", str(DEFAULT_PORT)).strip()
 
@@ -1809,10 +1810,8 @@ def start_server() -> bool:
     _state.http_server = server
 
     def _serve() -> None:
-        try:
+        with contextlib.suppress(Exception):
             server.serve_forever(poll_interval=0.25)
-        except Exception:
-            pass
 
     t = threading.Thread(target=_serve, name="IDAFastMCP_HTTPServer", daemon=True)
     _state.server_thread = t
@@ -1829,22 +1828,16 @@ def stop_server() -> None:
 
     _state.http_server = None
 
-    try:
+    with contextlib.suppress(Exception):
         server.shutdown()
-    except Exception:
-        pass
-    try:
+    with contextlib.suppress(Exception):
         server.server_close()
-    except Exception:
-        pass
 
     t = _state.server_thread
     _state.server_thread = None
     if t:
-        try:
+        with contextlib.suppress(Exception):
             t.join(timeout=1.0)
-        except Exception:
-            pass
 
     idaapi.msg("[IDA Fast MCP] Server stopped\n")
 

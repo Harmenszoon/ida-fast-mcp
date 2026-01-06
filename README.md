@@ -11,7 +11,7 @@ MCP server for IDA Pro. Built for automated reverse engineering.
 
 Context is finite. Every token an LLM spends parsing tool names, reading descriptions, or processing bloated output is a token not spent reasoning about your binary.
 
-- **11 tools** — no redundancy, no overlap, clear names like `get_function` and `list_imports`
+- **14 tools** — no redundancy, no overlap, clear verbs: `get_`, `list_`, `set_`, `find_`, `apply_`, `define_`
 - **Tight tool descriptions** — unambiguous inputs and outputs, so the model picks the right tool and uses it correctly the first time
 - **Bounded outputs** — pagination on all lists, no context bombs
 
@@ -38,17 +38,20 @@ No dependencies. No subprocess spawning. No environment setup.
 
 | Tool | Description |
 |------|-------------|
-| `get_binary_info` | Binary metadata + segments |
-| `get_function` | Decompiled pseudocode or disassembly |
+| `get_binary_info` | Binary metadata and segment list |
+| `get_function` | Decompiled pseudocode (falls back to disassembly) |
 | `get_xrefs` | Cross-references to address |
-| `list_functions` | List functions (filterable) |
-| `list_strings` | List strings (filterable) |
-| `list_imports` | List imports/exports |
-| `get_pointer_table` | Read pointer table entries |
-| `pattern_scan` | Search for byte patterns |
-| `rename` | Rename function/variable |
-| `set_type` | Set type annotation |
-| `set_comment` | Set comment |
+| `get_pointer_table` | Read pointer table (vtable, jump table) |
+| `get_type` | Type definition by name |
+| `list_functions` | Functions (filterable by name, size) |
+| `list_strings` | Strings (filterable by content, length) |
+| `list_imports` | Imports/exports (filterable) |
+| `list_types` | Types in local type library |
+| `find_pattern` | Byte pattern search |
+| `set_name` | Rename symbol or local variable |
+| `set_comment` | Set comment at address |
+| `apply_type` | Apply type to address or local |
+| `define_type` | Parse C declaration into type library |
 
 ## Config
 
