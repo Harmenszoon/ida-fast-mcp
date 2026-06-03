@@ -27,11 +27,13 @@ Every error doubles your token cost. This server is shaped to minimize them. See
 Most clients just need the server URL in their MCP config. Example:
 ```json
 {
-  "ida-fast-mcp": {
+  "ida-pro": {
     "url": "http://127.0.0.1:13338/mcp"
   }
 }
 ```
+The key (`ida-pro` here) is yours to choose — it becomes the tool-name prefix the model
+sees (`mcp__ida-pro__get_function`), so a short, descriptive name helps tool selection.
 
 No dependencies. No environment setup.
 
