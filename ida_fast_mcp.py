@@ -1,5 +1,5 @@
 """
-IDA Fast MCP — single-file MCP server for IDA Pro (v5.0.0)
+IDA Fast MCP — single-file MCP server for IDA Pro (v5.1.0)
 
 What this is
 ------------
@@ -24,6 +24,14 @@ Compatibility
 Transport
 ---------
 POST /mcp  (JSON-RPC 2.0 request/response; no SSE/streaming, no batch requests)
+
+Security
+--------
+For a single local user. Binds loopback only, and every request is checked: the Host
+header must be loopback (defeats DNS rebinding), any browser Origin is rejected (legit
+MCP clients send none), and Content-Type must be application/json. No CORS is granted.
+Note that run_python is full code execution by design — these checks protect the
+endpoint from other local processes and from web pages, not the snippet itself.
 
 Install
 -------
@@ -76,7 +84,7 @@ import idc
 # Configuration & limits
 # =============================================================================
 
-VERSION = "5.0.0"
+VERSION = "5.1.0"
 MCP_ENDPOINT = "/mcp"
 
 DEFAULT_HOST = "127.0.0.1"
@@ -330,14 +338,20 @@ def _parse_address(value: Any) -> int:
     if not s:
         raise ValueError("Address is required")
 
-    # 1) Hex parse (with or without 0x)
-    if _is_hex(s):
+    # 1) An explicit 0x prefix is unambiguously a hex address.
+    if s[:2].lower() == "0x" and _is_hex(s):
         return int(s, 16)
 
-    # 2) Direct name lookup (handles mangled names too)
+    # 2) Prefer a symbol match (handles mangled names too) before treating a bare token
+    #    as hex — otherwise a symbol literally named like hex (e.g. "deadbeef") would be
+    #    misread as the address 0xdeadbeef.
     ea = ida_name.get_name_ea(idaapi.BADADDR, s)
     if ea != idaapi.BADADDR:
         return ea
+
+    # 3) Fall back to bare hex (no prefix) for convenience.
+    if _is_hex(s):
+        return int(s, 16)
 
     raise ValueError(
         f"Cannot resolve '{s}' to an address. "
@@ -459,10 +473,15 @@ def _tool_get_binary_info(_args: dict[str, Any]) -> dict[str, Any]:
     path = ida_nalt.get_input_file_path() or ""
     base = ida_nalt.get_imagebase()
 
-    # Entrypoint - inf_get_start_ip is authoritative in IDA 9.x
-    entry = ida_ida.inf_get_start_ip()
+    # Entrypoint: prefer the linear program entry (start_ea); fall back to the real-mode
+    # IP (start_ip) for segmented binaries, then to the first declared entry point.
+    entry = idaapi.BADADDR
+    _get_start_ea = getattr(ida_ida, "inf_get_start_ea", None)
+    if _get_start_ea is not None:
+        entry = _get_start_ea()
+    if entry == idaapi.BADADDR:
+        entry = ida_ida.inf_get_start_ip()
     if entry == idaapi.BADADDR and ida_entry.get_entry_qty() > 0:
-        # Fallback to first entry point
         entry = ida_entry.get_entry(ida_entry.get_entry_ordinal(0))
 
     # Bitness / architecture (ida_ida has inf_is_64bit/inf_is_16bit but NOT inf_is_32bit)
@@ -1016,7 +1035,11 @@ def _tool_set_type(args: dict[str, Any]) -> dict[str, Any]:
     if func:
         apply_ea = func.start_ea
 
+    # idc.SetType often needs a trailing ';'; retry with one appended (the local-variable
+    # path above does the same) so callers can pass bare declarations like 'int *'.
     ok = bool(idc.SetType(apply_ea, type_decl))
+    if not ok and not type_decl.rstrip().endswith(';'):
+        ok = bool(idc.SetType(apply_ea, type_decl + ';'))
     if not ok:
         raise ValueError(
             f"Failed to apply type at {_format_ea(apply_ea)}. "
@@ -1383,7 +1406,9 @@ def _tool_run_python(args: dict[str, Any]) -> dict[str, Any]:
     any failure (syntax, runtime, timeout, oversized _result). The deadline guard
     (sys.settrace) interrupts Python-level runaways (loops) only: a single long native
     call cannot be interrupted, partial writes are not rolled back, and a hard SDK crash
-    is not catchable.
+    is not catchable. The guard is a convenience limit, not a sandbox: a snippet can
+    disable it (sys.settrace(None)) or spawn threads that outlive the call, so treat
+    run_python as full, unsandboxed code execution.
     """
     code = str(_require_param(args, "code"))
     if not code.strip():
@@ -1588,18 +1613,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                               "offset": _P_OFFSET}, ["pattern"])},
 
     # Mutation operations
+    # Provide EITHER address+new_name, OR names — enforced at runtime in _tool_rename,
+    # not via a root-level anyOf: Anthropic's tool input_schema validator rejects top-level
+    # combinators and Claude Code silently drops any tool whose schema uses one. The either/or
+    # contract lives in the descriptions instead so the schema root stays a plain object.
     {"name": "set_name",
-     "description": "Rename one symbol or local variable (locals need old_name), or many globals at once via names. Avoid IDA prefixes (sub_, loc_, etc.).",
-     "inputSchema": {**_schema({"address": {"type": "string", "description": "Address, or function address for locals"},
-                                "new_name": {"type": "string", "description": "New name"},
-                                "old_name": {"type": "string", "description": "Current name (required for locals)"},
-                                "names": {"type": "array",
-                                          "description": "Bulk global rename (globals only; rename locals one at a time): [{address, new_name}, …]",
-                                          "items": {"type": "object",
-                                                    "properties": {"address": {"type": "string"}, "new_name": {"type": "string"}},
-                                                    "required": ["address", "new_name"],
-                                                    "additionalProperties": False}}}),
-                     "anyOf": [{"required": ["address", "new_name"]}, {"required": ["names"]}]}},
+     "description": "Rename one symbol/local (locals need old_name), or many globals at once via names. "
+                    "Provide EITHER address+new_name, OR names — not both. Avoid IDA prefixes (sub_, loc_, etc.).",
+     "inputSchema": _schema({"address": {"type": "string", "description": "Single rename: address, or function address for a local. Pair with new_name; omit when using names."},
+                              "new_name": {"type": "string", "description": "Single rename: new name. Pair with address; omit when using names."},
+                              "old_name": {"type": "string", "description": "Single local rename only: current local name (requires address + new_name)."},
+                              "names": {"type": "array",
+                                        "description": "Bulk global rename (globals only): [{address, new_name}, …]. Omit address/new_name/old_name when using this.",
+                                        "items": {"type": "object",
+                                                  "properties": {"address": {"type": "string"}, "new_name": {"type": "string"}},
+                                                  "required": ["address", "new_name"],
+                                                  "additionalProperties": False}}})},
 
     {"name": "set_comment",
      "description": "Set a comment. A function-entry address gets a function (decompiler header) comment; any other address gets a line comment. Overwrites existing.",
@@ -1636,12 +1665,12 @@ _TOOL_SCHEMA_MAP: dict[str, dict[str, Any]] = {s["name"]: s["inputSchema"] for s
 # MCP result formatting
 # =============================================================================
 
-def _tool_success(data: dict[str, Any]) -> dict[str, Any]:
+def _tool_success(data: dict[str, Any], is_error: bool = False) -> dict[str, Any]:
     # MCP: include both 'content' (text) and 'structuredContent' (machine-readable).
     return {
         "content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
         "structuredContent": data,
-        "isError": False,
+        "isError": is_error,
     }
 
 
@@ -1692,9 +1721,16 @@ def _validate_tool_args(tool_name: str, arguments: dict[str, Any]) -> None:
         raise ValueError(f"Missing required argument(s) for {tool_name}: {', '.join(sorted(missing))}")
 
 
+# Protocol versions this server speaks, newest first. We echo the client's requested
+# version when we support it, otherwise we offer our newest (per MCP initialize rules)
+# rather than blindly claiming support for whatever the client asked for.
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+
+
 def _handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
-    # MCP 2025 streamable HTTP: initialize handshake
-    proto = params.get("protocolVersion") or "2025-03-26"
+    # MCP streamable HTTP initialize handshake.
+    requested = params.get("protocolVersion")
+    proto = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else SUPPORTED_PROTOCOL_VERSIONS[0]
     return {
         "protocolVersion": proto,
         "capabilities": {"tools": {"listChanged": False}},
@@ -1732,24 +1768,28 @@ def _handle_prompts_list(_params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _handle_jsonrpc_request(payload: Any) -> dict[str, Any] | None:
-    # Notifications: id absent => no response
+    # A request without "id" is a notification: per JSON-RPC we send no response at all,
+    # not even on error. (A non-dict payload has no id and is treated as a real error.)
     req_id = payload.get("id") if isinstance(payload, dict) else None
     is_notification = isinstance(payload, dict) and ("id" not in payload)
+
+    def fail(code: int, message: str) -> dict[str, Any] | None:
+        return None if is_notification else _jsonrpc_error(req_id, code, message)
 
     if not isinstance(payload, dict):
         return _jsonrpc_error(None, JsonRpcError.INVALID_REQUEST, "Invalid Request")
 
     if payload.get("jsonrpc") != "2.0":
-        return _jsonrpc_error(req_id, JsonRpcError.INVALID_REQUEST, "Invalid Request")
+        return fail(JsonRpcError.INVALID_REQUEST, "Invalid Request")
 
     method = payload.get("method")
     params = payload.get("params") or {}
 
     if not isinstance(method, str):
-        return _jsonrpc_error(req_id, JsonRpcError.INVALID_REQUEST, "Invalid Request")
+        return fail(JsonRpcError.INVALID_REQUEST, "Invalid Request")
 
     if not isinstance(params, dict):
-        return _jsonrpc_error(req_id, JsonRpcError.INVALID_PARAMS, "Params must be an object")
+        return fail(JsonRpcError.INVALID_PARAMS, "Params must be an object")
 
     # MCP clients may send cancellations/notifications; ignore them.
     if method.startswith("notifications/"):
@@ -1767,14 +1807,14 @@ def _handle_jsonrpc_request(payload: Any) -> dict[str, Any] | None:
         elif method == "prompts/list":
             result = _handle_prompts_list(params)
         else:
-            return _jsonrpc_error(req_id, JsonRpcError.METHOD_NOT_FOUND, f"Method not found: {method}")
+            return fail(JsonRpcError.METHOD_NOT_FOUND, f"Method not found: {method}")
     except KeyError as e:
-        return _jsonrpc_error(req_id, JsonRpcError.METHOD_NOT_FOUND, str(e))
+        return fail(JsonRpcError.METHOD_NOT_FOUND, str(e))
     except ValueError as e:
-        return _jsonrpc_error(req_id, JsonRpcError.INVALID_PARAMS, str(e))
+        return fail(JsonRpcError.INVALID_PARAMS, str(e))
     except Exception as e:
         # Never crash the server on unexpected errors
-        return _jsonrpc_error(req_id, JsonRpcError.INTERNAL_ERROR, f"Internal error: {type(e).__name__}: {e}")
+        return fail(JsonRpcError.INTERNAL_ERROR, f"Internal error: {type(e).__name__}: {e}")
 
     if is_notification:
         return None
@@ -1798,7 +1838,10 @@ def _execute_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         data = _ida_execute(lambda: tool_fn(arguments), write=requires_write)
     except Exception as e:  # noqa: BLE001 - any tool failure becomes a clean MCP error
         return _tool_error(str(e) or type(e).__name__)
-    return _tool_success(data)
+    # run_python reports snippet failures in-band via data["error"]; surface those as MCP
+    # tool errors (isError) while preserving the structured stdout/error payload.
+    is_error = tool_name == "run_python" and isinstance(data, dict) and data.get("error") is not None
+    return _tool_success(data, is_error=is_error)
 
 
 # =============================================================================
@@ -1814,6 +1857,33 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
     # Use HTTP/1.1 but force Connection: close to avoid persistent connections.
     protocol_version = "HTTP/1.1"
 
+    # Hostnames we treat as "this machine" for Host/Origin validation.
+    _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+    def _request_is_allowed(self) -> bool:
+        """Reject requests that could originate from another host or a web page.
+
+        Defends a localhost server that exposes code execution against DNS-rebinding and
+        browser-driven CSRF: the Host header must name loopback (or the configured bind
+        host), and any Origin header — which legitimate non-browser MCP clients do not
+        send — must likewise be loopback.
+        """
+        allowed = self._LOOPBACK_HOSTS | {str(self.server.server_address[0]).lower()}
+
+        def _hostname(value: str) -> str:
+            # Strip scheme (for Origin), then :port, then IPv6 brackets.
+            if "://" in value:
+                value = value.split("://", 1)[1]
+            return value.rsplit(":", 1)[0].strip("[]").lower()
+
+        host = self.headers.get("Host", "")
+        if host and _hostname(host) not in allowed:
+            return False
+
+        # Legitimate non-browser MCP clients send no Origin; any present one must be loopback.
+        origin = self.headers.get("Origin")
+        return not (origin and _hostname(origin) not in allowed)
+
     def log_message(self, *_args: Any) -> None:
         # Silence default request logging (IDA output noise).
         return
@@ -1826,7 +1896,6 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "close")
             self.end_headers()
@@ -1850,12 +1919,12 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             self._send_text(404, "Not Found")
             return
 
+        # Deliberately grant no CORS: this endpoint is for local, non-browser MCP clients.
+        # With no Access-Control-Allow-Origin, a browser preflight fails and the cross-site
+        # request never reaches do_POST.
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             self.send_response(204)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
-            self.send_header("Access-Control-Max-Age", "86400")
+            self.send_header("Allow", "POST, OPTIONS")
             self.send_header("Connection", "close")
             self.end_headers()
 
@@ -1863,6 +1932,17 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         self.close_connection = True
         if self.path != MCP_ENDPOINT:
             self._send_text(404, "Not Found")
+            return
+
+        # Reject browser/cross-host requests before doing any work (see _request_is_allowed).
+        if not self._request_is_allowed():
+            self._send_text(403, "Forbidden")
+            return
+
+        # Require a JSON content type; this also blocks simple cross-site form posts, which
+        # can only send text/plain, multipart/form-data, or urlencoded bodies.
+        if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+            self._send_text(415, "Unsupported Media Type: expected application/json")
             return
 
         # Read request body (bounded)
@@ -1899,8 +1979,10 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
         response = _handle_jsonrpc_request(payload)
         if response is None:
+            # Accepted notification with no reply body (MCP Streamable HTTP: 202 Accepted).
             with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-                self.send_response(204)
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
                 self.send_header("Connection", "close")
                 self.end_headers()
             return
@@ -1909,8 +1991,16 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self.close_connection = True
-        # The only endpoint is POST /mcp.
-        self._send_text(404, "Not Found")
+        if self.path != MCP_ENDPOINT:
+            self._send_text(404, "Not Found")
+            return
+        # The endpoint exists but offers no SSE/GET stream; advertise the allowed methods.
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            self.send_response(405)
+            self.send_header("Allow", "POST, OPTIONS")
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
 
 
 # =============================================================================
