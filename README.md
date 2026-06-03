@@ -71,6 +71,15 @@ IDA_FAST_MCP_HOST=127.0.0.1
 IDA_FAST_MCP_PORT=13338
 ```
 
+## Security
+
+Built for a single local user. The server binds loopback only, and `run_python` runs
+arbitrary IDAPython — code execution in the IDA process — so the HTTP layer is the trust
+boundary. Every request is validated: the `Host` header must be loopback (defeats DNS
+rebinding), any `Origin` must be loopback so web pages can't drive it (legitimate
+non-browser MCP clients send none), and the body must be `application/json`. No CORS is
+granted. Use a local, non-browser MCP client and keep the bind address on loopback.
+
 ## License
 
 [Unlicense](LICENSE) — Public domain

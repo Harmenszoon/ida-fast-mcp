@@ -41,6 +41,17 @@ native call still cannot be preempted.
 - Addresses are lowercase hex strings (`0x401000`); tools also accept symbol names.
 - List and search tools paginate with `offset` / `limit` and return `count` plus
   `next_offset` (and `total` where it is cheap to count).
-- Tool errors are plain, actionable text with `isError: true`; `run_python` instead
-  reports snippet failures (syntax/runtime/timeout/oversized) in its `error` field.
+- Tool errors are plain, actionable text with `isError: true`. `run_python` also sets
+  `isError: true` on failure, and additionally returns the structured snippet failure
+  (syntax/runtime/timeout/oversized) in its `error` field alongside any captured stdout.
 - Transport is `POST /mcp`, JSON-RPC 2.0, one request per HTTP call.
+
+## Security
+
+Single local user, loopback only. `run_python` is full IDAPython execution — arbitrary
+code in the IDA process — so the HTTP layer is the trust boundary, not the snippet. Every
+request is checked before any work runs: the `Host` header must name loopback (defeats DNS
+rebinding), any `Origin` must be loopback (legitimate non-browser MCP clients send none, so
+this rejects browser-driven CSRF), and `Content-Type` must be `application/json`. No CORS
+is granted. Other local processes and web pages therefore cannot drive the server — but
+anything that clears these checks has full power, so keep the bind address on loopback.
