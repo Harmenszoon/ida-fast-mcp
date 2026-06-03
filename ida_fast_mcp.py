@@ -1,22 +1,25 @@
 """
-IDA Fast MCP — single-file MCP server for IDA Pro (v4.10.0)
+IDA Fast MCP — single-file MCP server for IDA Pro (v5.0.0)
 
-Purpose
--------
-Expose a minimal, stable set of reverse-engineering tools (14 tools) to
-high-capability AI agents via MCP (Model Context Protocol) over Streamable HTTP.
+What this is
+------------
+A minimal MCP (Model Context Protocol) server, embedded as an IDA Pro plugin,
+that exposes a tight set of reverse-engineering tools to LLM agents over
+Streamable HTTP. Built for a single local user and shaped for clean,
+first-try LLM tool use.
+
+Design
+------
+- One constraint drives everything: IDA's API is single-threaded, so every
+  tool runs on IDA's main thread via execute_sync(). That call already
+  serializes work, so the server stays a thin request -> tool -> JSON wrapper.
+- Single file, zero dependencies: Python stdlib + IDA modules only.
+- Bounded outputs: strict limits and deterministic pagination on every list.
+- Pseudocode first: decompile with per-line addresses; fall back to disassembly.
 
 Compatibility
 -------------
-- IDA Pro 9.x with Hex-Rays Decompiler (uses ida_ida, ida_hexrays, ida_lines)
-
-Design goals (from design reference)
-------------------------------------
-- Stability first: all IDA API calls run on the main thread via execute_sync()
-  and every tool call has a hard 5s timeout.
-- Single file, zero dependencies: stdlib + IDA modules only.
-- Bounded outputs: strict limits + deterministic pagination.
-- Pseudocode first: decompile with address annotations; fall back to disassembly.
+- IDA Pro 9.x with the Hex-Rays decompiler.
 
 Transport
 ---------
@@ -28,16 +31,10 @@ Copy this file to your IDA plugins directory and restart IDA.
 
 Config
 ------
-Defaults to 127.0.0.1:13338
-
-Environment variables:
+Defaults to 127.0.0.1:13338. Override via environment or plugin options:
   IDA_FAST_MCP_HOST=127.0.0.1
   IDA_FAST_MCP_PORT=13338
-
-plugins.cfg (plugin options):
-  ida_fast_mcp:host=127.0.0.1;port=13338
-
-Note: This is a local, single-user tool. Host is restricted to localhost/127.0.0.1.
+  plugins.cfg:  ida_fast_mcp:host=127.0.0.1;port=13338
 """
 
 from __future__ import annotations
@@ -45,13 +42,15 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import queue
 import re
+import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import StringIO
 from typing import Any
 
 import ida_bytes
@@ -74,26 +73,21 @@ import idautils
 import idc
 
 # =============================================================================
-# Configuration & limits (design reference)
+# Configuration & limits
 # =============================================================================
 
-VERSION = "4.10.0"
+VERSION = "5.0.0"
 MCP_ENDPOINT = "/mcp"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 13338
 
-# Timeout configuration (seconds) — Stability First
-# Total timeout is the max time any request can take from arrival to response.
-# Lock wait timeout is how long a request will wait for its turn if another is running.
-# These share a budget: if lock takes 4s, execution gets remaining 1s.
-TOTAL_TIMEOUT_SECONDS = 5.0
-LOCK_WAIT_TIMEOUT_SECONDS = 4.0  # Max time waiting for lock (leaves 1s minimum for execution)
-MIN_EXECUTION_HEADROOM = 0.5  # Seconds reserved for execution when calculating lock wait
-MIN_EXECUTION_THRESHOLD = 0.1  # Minimum remaining time required to attempt execution
-
 # Internal limits (named constants for maintainability)
 AVAILABLE_VARS_DISPLAY_MAX = 20
+
+# run_python wall-clock budget. The guard (sys.settrace) interrupts Python-level
+# runaways (loops) only — a single long native call or hard crash cannot be stopped.
+RUN_PYTHON_TIMEOUT_SECONDS = 15.0
 
 
 # Output bounds (defaults + maxima)
@@ -107,9 +101,13 @@ class Limits:
 
     STRINGS_DEFAULT = 30
     STRINGS_MAX = 100
+    STRING_VALUE_MAX = 256  # truncate each value in list_strings
 
     IMPORTS_DEFAULT = 30
     IMPORTS_MAX = 100
+
+    TYPES_DEFAULT = 30
+    TYPES_MAX = 100
 
     POINTER_TABLE_DEFAULT = 25
     POINTER_TABLE_MAX = 100
@@ -121,8 +119,16 @@ class Limits:
     # code output
     CODE_LINES_MAX = 2000
 
+    # write ops
+    RENAME_BATCH_MAX = 100  # max symbols per bulk set_name call
+
     # HTTP safety
     HTTP_BODY_MAX = 2 * 1024 * 1024  # 2 MiB
+
+    # run_python output limits
+    PYTHON_STDOUT_MAX = 64 * 1024     # 64 KB captured stdout/stderr
+    PYTHON_RESULT_MAX = 64 * 1024     # 64 KB serialized _result
+    PYTHON_TRACEBACK_MAX = 4 * 1024   # 4 KB error traceback
 
 
 # =============================================================================
@@ -131,8 +137,6 @@ class Limits:
 
 @dataclass
 class _State:
-    tool_lock: threading.Lock = field(default_factory=threading.Lock)
-
     http_server: ThreadingHTTPServer | None = None
     server_thread: threading.Thread | None = None
 
@@ -140,13 +144,32 @@ class _State:
 _state = _State()
 
 
+def _build_python_namespace() -> dict[str, Any]:
+    """Fresh namespace for run_python, with common IDA modules preloaded."""
+    return {
+        "ida_bytes": ida_bytes,
+        "ida_entry": ida_entry,
+        "ida_funcs": ida_funcs,
+        "ida_hexrays": ida_hexrays,
+        "ida_ida": ida_ida,
+        "ida_kernwin": ida_kernwin,
+        "ida_lines": ida_lines,
+        "ida_nalt": ida_nalt,
+        "ida_name": ida_name,
+        "ida_segment": ida_segment,
+        "ida_strlist": ida_strlist,
+        "ida_typeinf": ida_typeinf,
+        "ida_xref": ida_xref,
+        "idaapi": idaapi,
+        "idautils": idautils,
+        "idc": idc,
+        "_result": None,
+    }
+
+
 # =============================================================================
 # Small helpers
 # =============================================================================
-
-def _now() -> float:
-    return time.monotonic()
-
 
 def _clamp_int(value: Any, *, default: int, min_value: int, max_value: int) -> int:
     """Parse value as int, falling back to default; clamp result to [min_value, max_value]."""
@@ -189,6 +212,13 @@ def _get_offset(args: dict[str, Any]) -> int:
     return max(0, int(args.get("offset", 0) or 0))
 
 
+def _get_bool(value: Any) -> bool:
+    """Coerce a flag to bool, treating the strings 'false'/'0'/'no'/'' as False."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
 def _normalize_size(size: int) -> int:
     """Convert BADSIZE to -1 for cleaner output."""
     # BADSIZE is 0xFFFFFFFFFFFFFFFF or similar large values
@@ -214,19 +244,24 @@ def _paginated(key: str, items: list, offset: int, limit: int, total: int, **ext
 # =============================================================================
 
 def _ida_execute(fn: Callable[[], Any], *, write: bool) -> Any:
-    """Run fn on IDA's main thread via execute_sync."""
+    """Run fn on IDA's main thread via execute_sync (which serializes all callers)."""
     result: Any = None
     exception: BaseException | None = None
+    ran = False
 
-    def _wrapper() -> None:
-        nonlocal result, exception
+    def _wrapper() -> int:
+        nonlocal result, exception, ran
+        ran = True
         try:
             result = fn()
-        except BaseException as e:
+        except BaseException as e:  # noqa: BLE001 - captured and re-raised to the caller
             exception = e
+        return 0
 
     ida_kernwin.execute_sync(_wrapper, ida_kernwin.MFF_WRITE if write else ida_kernwin.MFF_READ)
 
+    if not ran:
+        raise RuntimeError("IDA did not run the request (execute_sync failed)")
     if exception is not None:
         raise exception
     return result
@@ -398,10 +433,9 @@ def _iter_exports() -> Iterable[dict[str, Any]]:
 # =============================================================================
 
 _XREF_TYPE_MAP: dict[int, str] = {
-    # Code xrefs
+    # Code xrefs (ordinary flow / fall-through is filtered out before categorizing)
     ida_xref.fl_CF: "call", ida_xref.fl_CN: "call",  # far/near call
     ida_xref.fl_JF: "jump", ida_xref.fl_JN: "jump",  # far/near jump
-    ida_xref.fl_F: "flow",                            # ordinary flow
     # Data xrefs
     ida_xref.dr_O: "offset",  # offset reference
     ida_xref.dr_W: "write",   # write access
@@ -415,7 +449,7 @@ def _categorize_xref_type(xref_type: int) -> str:
 
 
 # =============================================================================
-# Tool implementations (11 tools)
+# Tool implementations
 # =============================================================================
 
 def _tool_get_binary_info(_args: dict[str, Any]) -> dict[str, Any]:
@@ -431,8 +465,8 @@ def _tool_get_binary_info(_args: dict[str, Any]) -> dict[str, Any]:
         # Fallback to first entry point
         entry = ida_entry.get_entry(ida_entry.get_entry_ordinal(0))
 
-    # Bitness / architecture
-    bitness = 64 if ida_ida.inf_is_64bit() else (32 if ida_ida.inf_is_32bit() else 16)
+    # Bitness / architecture (ida_ida has inf_is_64bit/inf_is_16bit but NOT inf_is_32bit)
+    bitness = 64 if ida_ida.inf_is_64bit() else (16 if ida_ida.inf_is_16bit() else 32)
     proc = ida_ida.inf_get_procname() or ""
 
     proc_l = proc.lower()
@@ -497,26 +531,35 @@ def _tool_get_binary_info(_args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _func_size(start: int) -> int:
+    """Total function size in bytes, summing all chunks (tails included)."""
+    return sum(end - chunk_start for chunk_start, end in idautils.Chunks(start))
+
+
 def _build_disassembly(func: Any) -> str:
-    """Build disassembly output for a function with per-instruction address annotations."""
+    """Build disassembly for a function with per-instruction address annotations.
+
+    Iterates via FuncItems so non-contiguous (chunked) functions are fully covered.
+    """
     start = func.start_ea
-    end = func.end_ea
     name = ida_name.get_name(start) or f"sub_{start:x}"
 
     out: list[str] = [f"/* {_format_ea(start)} */ {name} proc"]
-    ea = start
     lines_emitted = 0
+    truncated = False
 
-    while ea != idaapi.BADADDR and ea < end and lines_emitted < Limits.CODE_LINES_MAX:
+    for ea in idautils.FuncItems(start):
+        if lines_emitted >= Limits.CODE_LINES_MAX:
+            truncated = True
+            break
         dis = ida_lines.generate_disasm_line(ea, 0)
         if dis:
             dis = ida_lines.tag_remove(dis).rstrip()
             if dis:
                 out.append(f"/* {_format_ea(ea)} */ {dis}")
                 lines_emitted += 1
-        ea = ida_bytes.next_head(ea, end)
 
-    if ea != idaapi.BADADDR and ea < end:
+    if truncated:
         out.append(f"/* ... truncated at {Limits.CODE_LINES_MAX} lines ... */")
 
     return "\n".join(out)
@@ -524,7 +567,7 @@ def _build_disassembly(func: Any) -> str:
 
 def _tool_get_function(args: dict[str, Any]) -> dict[str, Any]:
     ea = _parse_address(_require_param(args, "address"))
-    force_disasm = bool(args.get("force_disassembly", False))
+    force_disasm = _get_bool(args.get("force_disassembly"))
 
     func = ida_funcs.get_func(ea)
     if not func:
@@ -536,7 +579,7 @@ def _tool_get_function(args: dict[str, Any]) -> dict[str, Any]:
 
     start = func.start_ea
     name = ida_name.get_name(start) or f"sub_{start:x}"
-    size = func.end_ea - func.start_ea
+    size = _func_size(start)
 
     base = {"address": _format_ea(start), "name": name, "size": size}
 
@@ -575,6 +618,10 @@ def _tool_get_xrefs(args: dict[str, Any]) -> dict[str, Any]:
     xrefs_list: list[tuple[int, dict[str, Any]]] = []
 
     for xref in idautils.XrefsTo(ea):
+        # Skip ordinary flow (fall-through from the previous instruction): it is linear
+        # execution, not a real cross-reference, and IDA's own xref view excludes it.
+        if xref.type == ida_xref.fl_F:
+            continue
         from_ea = xref.frm
         cat = _categorize_xref_type(xref.type)
 
@@ -583,7 +630,11 @@ def _tool_get_xrefs(args: dict[str, Any]) -> dict[str, Any]:
             fn = ida_name.get_name(from_func.start_ea) or _format_ea(from_func.start_ea)
             obj = {"from_address": _format_ea(from_ea), "from_function": fn, "type": cat}
         else:
-            obj = {"from_address": _format_ea(from_ea), "from_function": None, "type": cat}
+            # Ref originates outside any function (e.g. a data/descriptor table); name the segment.
+            seg = ida_segment.getseg(from_ea)
+            seg_name = ida_segment.get_segm_name(seg) if seg else None
+            obj = {"from_address": _format_ea(from_ea), "from_function": None,
+                   "from_segment": seg_name, "type": cat}
 
         xrefs_list.append((from_ea, obj))
 
@@ -615,7 +666,7 @@ def _tool_list_functions(args: dict[str, Any]) -> dict[str, Any]:
         f = ida_funcs.get_func(fea)
         if not f:
             continue
-        size = f.end_ea - f.start_ea
+        size = _func_size(fea)
         if size < min_size:
             continue
         name = ida_name.get_name(fea) or f"sub_{fea:x}"
@@ -633,7 +684,10 @@ def _tool_list_functions(args: dict[str, Any]) -> dict[str, Any]:
 
 def _tool_list_strings(args: dict[str, Any]) -> dict[str, Any]:
     content_filter = str(args.get("filter", "") or "").lower()
-    min_length = max(0, int(args.get("min_length", 4) or 4))
+    try:
+        min_length = max(0, int(args.get("min_length", 4)))
+    except (TypeError, ValueError):
+        min_length = 4
     limit = _clamp_int(args.get("limit"), default=Limits.STRINGS_DEFAULT, min_value=1, max_value=Limits.STRINGS_MAX)
     offset = _get_offset(args)
 
@@ -646,31 +700,35 @@ def _tool_list_strings(args: dict[str, Any]) -> dict[str, Any]:
         if content_filter and content_filter not in val.lower():
             continue
         if total >= offset and len(out) < limit:
-            out.append({"address": _format_ea(s["address"]), "value": val, "string_type": s["string_type"]})
+            shown = val if len(val) <= Limits.STRING_VALUE_MAX else val[:Limits.STRING_VALUE_MAX] + "…"
+            out.append({"address": _format_ea(s["address"]), "value": shown, "string_type": s["string_type"]})
         total += 1
 
     return _paginated("strings", out, offset, limit, total)
 
 
 def _tool_list_imports(args: dict[str, Any]) -> dict[str, Any]:
-    """List imports and/or exports with optional filtering."""
+    """List imported and/or exported symbols (kind: imports, exports, both)."""
     name_filter = str(args.get("filter", "") or "").lower()
+    kind = str(args.get("kind", "imports") or "imports").lower()
+    if kind not in ("imports", "exports", "both"):
+        raise ValueError("kind must be 'imports', 'exports', or 'both'")
     limit = _clamp_int(args.get("limit"), default=Limits.IMPORTS_DEFAULT, min_value=1, max_value=Limits.IMPORTS_MAX)
     offset = _get_offset(args)
-    include_exports = bool(args.get("exports", False))
 
     out: list[dict[str, Any]] = []
     total = 0
 
-    for imp in _iter_imports():
-        nm, mod = imp["name"], imp["module"]
-        if name_filter and name_filter not in nm.lower() and name_filter not in mod.lower():
-            continue
-        if total >= offset and len(out) < limit:
-            out.append({"address": _format_ea(imp["address"]), "name": nm, "module": mod, "type": "import"})
-        total += 1
+    if kind in ("imports", "both"):
+        for imp in _iter_imports():
+            nm, mod = imp["name"], imp["module"]
+            if name_filter and name_filter not in nm.lower() and name_filter not in mod.lower():
+                continue
+            if total >= offset and len(out) < limit:
+                out.append({"address": _format_ea(imp["address"]), "name": nm, "module": mod, "type": "import"})
+            total += 1
 
-    if include_exports:
+    if kind in ("exports", "both"):
         for exp in _iter_exports():
             nm = exp["name"]
             if name_filter and name_filter not in nm.lower():
@@ -683,7 +741,7 @@ def _tool_list_imports(args: dict[str, Any]) -> dict[str, Any]:
                 out.append(entry)
             total += 1
 
-    return _paginated("imports", out, offset, limit, total)
+    return _paginated("symbols", out, offset, limit, total)
 
 
 def _tool_get_pointer_table(args: dict[str, Any]) -> dict[str, Any]:
@@ -731,14 +789,15 @@ def _tool_get_pointer_table(args: dict[str, Any]) -> dict[str, Any]:
             entry["target"] = None
             entry["name"] = None
         else:
-            # Try to resolve to a function
-            target_func = ida_funcs.get_func(ptr)
-            if target_func:
-                entry["target"] = _format_ea(target_func.start_ea)
-                entry["name"] = ida_name.get_name(target_func.start_ea)
-            else:
-                entry["target"] = _format_ea(ptr)
-                entry["name"] = ida_name.get_name(ptr)
+            # target is the actual destination; name resolves it to a symbol or func+offset.
+            entry["target"] = _format_ea(ptr)
+            name = ida_name.get_name(ptr)
+            if not name:
+                target_func = ida_funcs.get_func(ptr)
+                if target_func:
+                    base = ida_name.get_name(target_func.start_ea) or _format_ea(target_func.start_ea)
+                    name = base if ptr == target_func.start_ea else f"{base}+0x{ptr - target_func.start_ea:x}"
+            entry["name"] = name or None
 
         entries.append(entry)
 
@@ -770,7 +829,42 @@ def _get_available_local_vars(func_ea: int) -> list[str]:
         return []
 
 
+def _rename_batch(names: Any) -> dict[str, Any]:
+    """Bulk-rename global symbols. names = [{address, new_name}, ...]; returns failures only."""
+    if not isinstance(names, list) or not names:
+        raise ValueError("names must be a non-empty array of {address, new_name}")
+    if len(names) > Limits.RENAME_BATCH_MAX:
+        raise ValueError(f"Too many names ({len(names)}); max {Limits.RENAME_BATCH_MAX} per call")
+
+    renamed = 0
+    failed: list[dict[str, Any]] = []
+    for item in names:
+        is_obj = isinstance(item, dict)
+        addr = item.get("address") if is_obj else None
+        nm_raw = item.get("new_name") if is_obj else None
+        try:
+            if not is_obj:
+                raise ValueError("each item must be an object {address, new_name}")
+            ea = _parse_address(_require_param(item, "address"))
+            nm = str(_require_param(item, "new_name")).strip()
+            if not nm:
+                raise ValueError("new_name must be non-empty")
+            if not ida_name.set_name(ea, nm, ida_name.SN_NOWARN):
+                raise ValueError("rename failed (name exists, invalid chars, or auto-name pattern)")
+            renamed += 1
+        except ValueError as e:
+            failed.append({"address": addr, "new_name": nm_raw, "error": str(e)})
+
+    return {"renamed": renamed, "total": len(names), "failed": failed}
+
+
 def _tool_rename(args: dict[str, Any]) -> dict[str, Any]:
+    # Bulk global rename when 'names' is supplied; reject mixing with single-form args.
+    if "names" in args:
+        if any(k in args for k in ("address", "new_name", "old_name")):
+            raise ValueError("Provide either 'names' (bulk globals) or address/new_name (single rename), not both.")
+        return _rename_batch(args["names"])
+
     ea = _parse_address(_require_param(args, "address"))
     new_name = str(_require_param(args, "new_name")).strip()
     old_name = args.get("old_name")
@@ -835,15 +929,25 @@ def _tool_rename(args: dict[str, Any]) -> dict[str, Any]:
 def _tool_set_comment(args: dict[str, Any]) -> dict[str, Any]:
     ea = _parse_address(_require_param(args, "address"))
     comment = str(_require_param(args, "comment"))
-    repeatable = bool(args.get("repeatable", False))
+    repeatable = _get_bool(args.get("repeatable"))
 
-    if not ida_bytes.set_cmt(ea, comment, repeatable):
+    # A comment at a function's entry is a function summary, so use a function comment
+    # (visible in the decompiler header). An item comment there is NOT shown by Hex-Rays.
+    func = ida_funcs.get_func(ea)
+    if func is not None and func.start_ea == ea:
+        ok = ida_funcs.set_func_cmt(func, comment, repeatable)
+        scope = "function"
+    else:
+        ok = ida_bytes.set_cmt(ea, comment, repeatable)
+        scope = "line"
+
+    if not ok:
         raise ValueError(
             f"Failed to set comment at {_format_ea(ea)}. "
-            f"Address may not be in analyzed code or data."
+            "Address may not be in analyzed code or data."
         )
 
-    return {"success": True, "address": _format_ea(ea)}
+    return {"success": True, "address": _format_ea(ea), "scope": scope}
 
 
 def _tool_set_type(args: dict[str, Any]) -> dict[str, Any]:
@@ -924,9 +1028,9 @@ def _tool_set_type(args: dict[str, Any]) -> dict[str, Any]:
 
 def _tool_define_type(args: dict[str, Any]) -> dict[str, Any]:
     """Parse C declaration into local type library."""
-    code = str(_require_param(args, "code")).strip()
+    code = str(_require_param(args, "declaration")).strip()
     if not code:
-        raise ValueError("code must be a non-empty string")
+        raise ValueError("declaration must be a non-empty string")
 
     # Try parsing with idc_parse_types (handles structs, enums, typedefs)
     # Returns number of errors (0 = success)
@@ -1009,7 +1113,7 @@ def _tool_get_type(args: dict[str, Any]) -> dict[str, Any]:
 def _tool_list_types(args: dict[str, Any]) -> dict[str, Any]:
     """List types in local type library."""
     filter_str = str(args.get("filter", "") or "").lower()
-    limit = _clamp_int(args.get("limit"), default=30, min_value=1, max_value=100)
+    limit = _clamp_int(args.get("limit"), default=Limits.TYPES_DEFAULT, min_value=1, max_value=Limits.TYPES_MAX)
     offset = _get_offset(args)
 
     til = ida_typeinf.get_idati()
@@ -1209,12 +1313,7 @@ def _tool_pattern_scan(args: dict[str, Any]) -> dict[str, Any]:
     # Resolve segment bounds
     bounds = _get_segment_bounds(segment)
     if not bounds:
-        return {
-            "matches": [],
-            "count": 0,
-            "total": 0,
-            "next_offset": None,
-        }
+        return {"matches": [], "count": 0, "next_offset": None}
 
     # Compile pattern once, reuse for all segments
     # Use first segment's start_ea for compilation (required by API but doesn't affect results)
@@ -1268,9 +1367,107 @@ def _tool_pattern_scan(args: dict[str, Any]) -> dict[str, Any]:
     return {
         "matches": results,
         "count": len(results),
-        "has_more": has_more,
         "next_offset": next_offset,
     }
+
+
+class _RunPythonTimeout(BaseException):
+    """Raised by the run_python deadline guard. Subclasses BaseException so a snippet's
+    own `except Exception:` cannot swallow it."""
+
+
+def _tool_run_python(args: dict[str, Any]) -> dict[str, Any]:
+    """Execute an IDAPython snippet in a fresh namespace under a wall-clock deadline.
+
+    Returns {stdout, result, error, truncated}; `error` is null on success or a dict on
+    any failure (syntax, runtime, timeout, oversized _result). The deadline guard
+    (sys.settrace) interrupts Python-level runaways (loops) only: a single long native
+    call cannot be interrupted, partial writes are not rolled back, and a hard SDK crash
+    is not catchable.
+    """
+    code = str(_require_param(args, "code"))
+    if not code.strip():
+        raise ValueError("code must be non-empty")
+
+    try:
+        compiled = compile(code, "<run_python>", "exec")
+    except SyntaxError as e:
+        return {
+            "stdout": "",
+            "result": None,
+            "error": {"type": "SyntaxError", "message": f"line {e.lineno}, column {e.offset}: {e.msg}"},
+            "truncated": False,
+        }
+
+    namespace = _build_python_namespace()
+    captured = StringIO()
+    deadline = time.monotonic() + RUN_PYTHON_TIMEOUT_SECONDS
+
+    def _guard(_frame: Any, _event: str, _arg: Any) -> Any:
+        # Fires per Python line/call on the exec'd frame; raises once the budget is spent.
+        if time.monotonic() > deadline:
+            raise _RunPythonTimeout
+        return _guard
+
+    # Run under the deadline guard; only capture the outcome here. Error data is built
+    # AFTER the guard is removed, so formatting it (traceback/str) can't trip the guard.
+    timed_out = False
+    exc: BaseException | None = None
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    old_trace = sys.gettrace()
+    try:
+        sys.stdout = captured
+        sys.stderr = captured
+        sys.settrace(_guard)
+        try:
+            exec(compiled, namespace)
+        except _RunPythonTimeout:
+            timed_out = True
+        except BaseException as e:  # noqa: BLE001 - capture any failure (incl. SystemExit) as data
+            exc = e
+    finally:
+        sys.settrace(old_trace)
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+
+    error: dict[str, Any] | None = None
+    if timed_out:
+        error = {
+            "type": "Timeout",
+            "message": (
+                f"Exceeded {int(RUN_PYTHON_TIMEOUT_SECONDS)}s and was interrupted between operations "
+                "(any writes already made remain). Narrow the query or avoid unbounded loops."
+            ),
+        }
+    elif exc is not None:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        if len(tb) > Limits.PYTHON_TRACEBACK_MAX:
+            tb = "…(truncated)\n" + tb[-Limits.PYTHON_TRACEBACK_MAX:]
+        error = {"type": type(exc).__name__, "message": str(exc)[:1000], "traceback": tb}
+
+    stdout = captured.getvalue()
+    truncated = len(stdout) > Limits.PYTHON_STDOUT_MAX
+    if truncated:
+        stdout = stdout[:Limits.PYTHON_STDOUT_MAX] + "\n... (truncated)"
+
+    result = namespace.get("_result")
+    if error is None and result is not None:
+        try:
+            encoded = json.dumps(result, allow_nan=False)
+        except (TypeError, ValueError):
+            result, error = None, {
+                "type": "ResultNotSerializable",
+                "message": f"_result ({type(result).__name__}) is not JSON. Use dict/list/str/int/float/bool/None.",
+            }
+        else:
+            if len(encoded) > Limits.PYTHON_RESULT_MAX:
+                result, error = None, {
+                    "type": "ResultTooLarge",
+                    "message": f"_result is {len(encoded)} bytes (max {Limits.PYTHON_RESULT_MAX // 1024} KB). "
+                               "Return a bounded summary, not a full dump.",
+                }
+
+    return {"stdout": stdout, "result": result, "error": error, "truncated": truncated}
 
 
 # =============================================================================
@@ -1296,6 +1493,8 @@ _TOOL_DISPATCH: dict[str, tuple[Callable[[dict[str, Any]], dict[str, Any]], bool
     "set_comment": (_tool_set_comment, True),
     "apply_type": (_tool_set_type, True),
     "define_type": (_tool_define_type, True),
+    # Escape hatch
+    "run_python": (_tool_run_python, True),
 }
 
 # =============================================================================
@@ -1303,19 +1502,22 @@ _TOOL_DISPATCH: dict[str, tuple[Callable[[dict[str, Any]], dict[str, Any]], bool
 # =============================================================================
 
 # Schema property templates
-_P_ADDR = {"type": "string", "description": "Address or symbol name"}
+_P_ADDR = {"type": "string", "description": "Hex address (e.g. 0x401000) or symbol name"}
 _P_OFFSET = {"type": "integer", "default": 0, "minimum": 0}
 
 
 def _p_filter(noun: str) -> dict[str, Any]:
-    return {"type": "string", "default": "", "description": f"Substring match on {noun}"}
+    return {"type": "string", "default": "", "description": f"Case-insensitive substring match on {noun}"}
 
 
-def _p_limit(d: int, m: int) -> dict[str, Any]:
-    return {"type": "integer", "default": d, "maximum": m, "minimum": 1}
+def _p_limit(d: int, m: int, desc: str | None = None) -> dict[str, Any]:
+    p: dict[str, Any] = {"type": "integer", "default": d, "maximum": m, "minimum": 1}
+    if desc:
+        p["description"] = desc
+    return p
 
 
-def _schema(props: dict[str, Any], required: list[str] = None) -> dict[str, Any]:
+def _schema(props: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
     """Build an inputSchema dict with additionalProperties: false."""
     s: dict[str, Any] = {"type": "object", "properties": props, "additionalProperties": False}
     if required:
@@ -1335,15 +1537,15 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                               "force_disassembly": {"type": "boolean", "default": False, "description": "Skip decompiler"}}, ["address"])},
 
     {"name": "get_xrefs",
-     "description": "Cross-references to address (callers, data refs).",
+     "description": "Inbound cross-references to address (callers, data refs). For a function's callees, read get_function.",
      "inputSchema": _schema({"address": _P_ADDR,
                               "limit": _p_limit(Limits.XREFS_DEFAULT, Limits.XREFS_MAX),
                               "offset": _P_OFFSET}, ["address"])},
 
     {"name": "get_pointer_table",
-     "description": "Read pointer table (vtable, jump table). Resolves to symbols.",
+     "description": "Absolute pointer array at address (e.g. a vtable; not relative/RVA tables). Resolves each target to a symbol.",
      "inputSchema": _schema({"address": _P_ADDR,
-                              "count": _p_limit(Limits.POINTER_TABLE_DEFAULT, Limits.POINTER_TABLE_MAX)}, ["address"])},
+                              "count": _p_limit(Limits.POINTER_TABLE_DEFAULT, Limits.POINTER_TABLE_MAX, "Number of pointers to read")}, ["address"])},
 
     {"name": "get_type",
      "description": "Type definition by name. Returns C declaration.",
@@ -1351,49 +1553,56 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 
     # List operations
     {"name": "list_functions",
-     "description": "Functions by address. Filterable by name, size.",
+     "description": "Functions sorted by address. Filter by name substring and minimum byte size.",
      "inputSchema": _schema({"filter": _p_filter("name"),
-                              "min_size": {"type": "integer", "default": 0, "minimum": 0},
+                              "min_size": {"type": "integer", "default": 0, "minimum": 0, "description": "Minimum size in bytes"},
                               "limit": _p_limit(Limits.FUNCTIONS_DEFAULT, Limits.FUNCTIONS_MAX),
                               "offset": _P_OFFSET})},
 
     {"name": "list_strings",
-     "description": "Strings by address. Filterable by content, length.",
+     "description": "String literals. Filter by content substring and minimum length.",
      "inputSchema": _schema({"filter": _p_filter("content"),
-                              "min_length": {"type": "integer", "default": 4, "minimum": 0},
+                              "min_length": {"type": "integer", "default": 4, "minimum": 0, "description": "Minimum length"},
                               "limit": _p_limit(Limits.STRINGS_DEFAULT, Limits.STRINGS_MAX),
                               "offset": _P_OFFSET})},
 
     {"name": "list_imports",
-     "description": "Imports by address. Use 'exports' param for exports.",
+     "description": "Imported and/or exported symbols. Set kind to choose.",
      "inputSchema": _schema({"filter": _p_filter("name or module"),
-                              "exports": {"type": "boolean", "default": False, "description": "Include exports"},
+                              "kind": {"type": "string", "enum": ["imports", "exports", "both"], "default": "imports", "description": "Which symbols to list"},
                               "limit": _p_limit(Limits.IMPORTS_DEFAULT, Limits.IMPORTS_MAX),
                               "offset": _P_OFFSET})},
 
     {"name": "list_types",
      "description": "Types in local type library.",
      "inputSchema": _schema({"filter": _p_filter("name"),
-                              "limit": _p_limit(30, 100),
+                              "limit": _p_limit(Limits.TYPES_DEFAULT, Limits.TYPES_MAX),
                               "offset": _P_OFFSET})},
 
     # Search operations
     {"name": "find_pattern",
-     "description": "Byte pattern search. Returns matches with containing function.",
-     "inputSchema": _schema({"pattern": {"type": "string", "description": "Hex bytes, ?? wildcards (e.g., '48 8B ?? ??')"},
-                              "segment": {"type": "string", "description": "Limit to segment (e.g., '.text')"},
+     "description": "Byte pattern search (all segments unless 'segment' given). Returns matches with containing function.",
+     "inputSchema": _schema({"pattern": {"type": "string", "description": "Hex bytes; ? or ?? = whole-byte wildcard (e.g. '48 8B ?? ??')"},
+                              "segment": {"type": "string", "description": "Limit to segment (e.g. '.text')"},
                               "limit": _p_limit(Limits.PATTERN_SCAN_DEFAULT, Limits.PATTERN_SCAN_MAX),
                               "offset": _P_OFFSET}, ["pattern"])},
 
     # Mutation operations
     {"name": "set_name",
-     "description": "Rename symbol or local variable. Locals need 'old_name'. Avoid IDA prefixes (sub_, loc_, etc.).",
-     "inputSchema": _schema({"address": {"type": "string", "description": "Address, or function address for locals"},
-                              "new_name": {"type": "string", "description": "New name (no IDA prefixes like sub_XXXX)"},
-                              "old_name": {"type": "string", "description": "Current name (required for locals)"}}, ["address", "new_name"])},
+     "description": "Rename one symbol or local variable (locals need old_name), or many globals at once via names. Avoid IDA prefixes (sub_, loc_, etc.).",
+     "inputSchema": {**_schema({"address": {"type": "string", "description": "Address, or function address for locals"},
+                                "new_name": {"type": "string", "description": "New name"},
+                                "old_name": {"type": "string", "description": "Current name (required for locals)"},
+                                "names": {"type": "array",
+                                          "description": "Bulk global rename (globals only; rename locals one at a time): [{address, new_name}, …]",
+                                          "items": {"type": "object",
+                                                    "properties": {"address": {"type": "string"}, "new_name": {"type": "string"}},
+                                                    "required": ["address", "new_name"],
+                                                    "additionalProperties": False}}}),
+                     "anyOf": [{"required": ["address", "new_name"]}, {"required": ["names"]}]}},
 
     {"name": "set_comment",
-     "description": "Set comment at address. Overwrites existing.",
+     "description": "Set a comment. A function-entry address gets a function (decompiler header) comment; any other address gets a line comment. Overwrites existing.",
      "inputSchema": _schema({"address": _P_ADDR,
                               "comment": {"type": "string", "description": "Comment text"},
                               "repeatable": {"type": "boolean", "default": False, "description": "Show at xref locations"}}, ["address", "comment"])},
@@ -1401,12 +1610,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {"name": "apply_type",
      "description": "Apply type to address (data/function) or local variable.",
      "inputSchema": _schema({"address": {"type": "string", "description": "Address, or function address for locals"},
-                              "type": {"type": "string", "description": "C type (e.g., 'int *', 'int __fastcall f(void *)')"},
-                              "variable": {"type": "string", "description": "Local variable name"}}, ["address", "type"])},
+                              "type": {"type": "string", "description": "C type (e.g. 'int *', 'int __fastcall f(void *)')"},
+                              "variable": {"type": "string", "description": "Local variable name; if set, address is its function"}}, ["address", "type"])},
 
     {"name": "define_type",
      "description": "Parse C declaration into type library. Overwrites existing.",
-     "inputSchema": _schema({"code": {"type": "string", "description": "C declaration (e.g., 'struct X { int a; };')"}}, ["code"])},
+     "inputSchema": _schema({"declaration": {"type": "string", "description": "C declaration (e.g. 'struct X { int a; };')"}}, ["declaration"])},
+
+    # Escape hatch
+    {"name": "run_python",
+     "description": (
+         "IDAPython escape hatch — only for what no other tool can do: raw reads, bulk queries/searches "
+         "across the database, or writes set_/apply_/define_ can't. Otherwise call the dedicated tool. "
+         f"Terse code, no comments. Avoid unbounded loops ({int(RUN_PYTHON_TIMEOUT_SECONDS)}s limit). "
+         "Return one small value via _result. Example: _result = ida_bytes.get_qword(0x404000)"),
+     "inputSchema": _schema({"code": {"type": "string",
+                                       "description": "Terse IDAPython, already on IDA's main thread. Fresh namespace each call; common IDA modules preloaded."}}, ["code"])},
 ]
 
 # Pre-computed schema lookup for O(1) access
@@ -1418,7 +1637,7 @@ _TOOL_SCHEMA_MAP: dict[str, dict[str, Any]] = {s["name"]: s["inputSchema"] for s
 # =============================================================================
 
 def _tool_success(data: dict[str, Any]) -> dict[str, Any]:
-    # MCP: include both 'content' (text) and 'structuredContent' (machine-readable)
+    # MCP: include both 'content' (text) and 'structuredContent' (machine-readable).
     return {
         "content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
         "structuredContent": data,
@@ -1564,79 +1783,22 @@ def _handle_jsonrpc_request(payload: Any) -> dict[str, Any] | None:
 
 
 # =============================================================================
-# Tool execution wrapper (queued execution with timeout budget)
+# Tool execution
 # =============================================================================
 
 def _execute_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """
-    Execute a tool with proper queuing for parallel requests.
+    """Run a tool on IDA's main thread and wrap the result for MCP.
 
-    Parallel requests are queued via a blocking lock with timeout. The total
-    time budget (TOTAL_TIMEOUT_SECONDS) is shared between waiting for the lock
-    and actual execution. This ensures:
-    - Parallel requests are handled in order (no immediate rejection)
-    - No single request takes longer than the total timeout
-    - IDA API calls remain serialized for stability
+    execute_sync() already serializes every caller onto IDA's single main thread,
+    so no queue or lock is needed. A genuinely long operation (e.g. decompiling a
+    pathological function) blocks until it finishes — inherent to the single-thread model.
     """
     tool_fn, requires_write = _TOOL_DISPATCH[tool_name]
-
-    # Track total time budget
-    start_time = _now()
-    deadline = start_time + TOTAL_TIMEOUT_SECONDS
-
-    # Try to acquire lock, waiting up to LOCK_WAIT_TIMEOUT_SECONDS
-    # This queues parallel requests instead of rejecting them immediately
-    lock_wait = min(LOCK_WAIT_TIMEOUT_SECONDS, TOTAL_TIMEOUT_SECONDS - MIN_EXECUTION_HEADROOM)
-    lock_acquired = _state.tool_lock.acquire(blocking=True, timeout=lock_wait)
-
-    if not lock_acquired:
-        elapsed = _now() - start_time
-        return _tool_error(
-            f"Server busy — waited {elapsed:.1f}s for lock. "
-            "Another operation is taking too long. Retry shortly."
-        )
-
-    # Calculate remaining time for execution
-    remaining = deadline - _now()
-    if remaining <= MIN_EXECUTION_THRESHOLD:  # Not enough time left
-        _state.tool_lock.release()
-        return _tool_error("Request timed out waiting for lock — no time left for execution.")
-
-    result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
-
-    def worker() -> None:
-        try:
-            res = _ida_execute(lambda: tool_fn(arguments), write=requires_write)
-            result_queue.put((True, res))
-        except Exception as e:
-            result_queue.put((False, str(e)))
-        finally:
-            _state.tool_lock.release()
-
-    thread = threading.Thread(
-        target=worker,
-        name=f"IDAFastMCP_{tool_name}",
-        daemon=True,
-    )
     try:
-        thread.start()
-    except RuntimeError as e:
-        _state.tool_lock.release()
-        return _tool_error(f"Failed to start worker thread: {e}")
-
-    try:
-        ok, payload = result_queue.get(timeout=remaining)
-    except queue.Empty:
-        # Cannot reliably interrupt IDA work; lock will be released when worker finishes
-        total_elapsed = _now() - start_time
-        return _tool_error(
-            f"Operation timed out after {total_elapsed:.1f}s. "
-            "The server will remain busy until the operation completes."
-        )
-
-    if ok:
-        return _tool_success(payload)
-    return _tool_error(payload)
+        data = _ida_execute(lambda: tool_fn(arguments), write=requires_write)
+    except Exception as e:  # noqa: BLE001 - any tool failure becomes a clean MCP error
+        return _tool_error(str(e) or type(e).__name__)
+    return _tool_success(data)
 
 
 # =============================================================================
@@ -1659,25 +1821,28 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, body: Any) -> None:
         self.close_connection = True
         data = json.dumps(body, ensure_ascii=False, default=str).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(data)
+        # A client may give up before IDA finishes; ignore the broken connection.
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
 
     def _send_text(self, status: int, message: str) -> None:
         self.close_connection = True
         data = message.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(data)
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            self.send_response(status)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
 
     def do_OPTIONS(self) -> None:
         self.close_connection = True
@@ -1685,13 +1850,14 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             self._send_text(404, "Not Found")
             return
 
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Max-Age", "86400")
-        self.send_header("Connection", "close")
-        self.end_headers()
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Max-Age", "86400")
+            self.send_header("Connection", "close")
+            self.end_headers()
 
     def do_POST(self) -> None:
         self.close_connection = True
@@ -1726,23 +1892,24 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, _jsonrpc_error(None, JsonRpcError.PARSE_ERROR, f"Parse error: {e}"))
             return
 
-        # Reject batch requests (N tools × 5s timeout = stalls)
+        # Keep wire behavior simple: one JSON-RPC request per HTTP request.
         if isinstance(payload, list):
             self._send_json(200, _jsonrpc_error(None, JsonRpcError.INVALID_REQUEST, "Batch requests not supported."))
             return
 
         response = _handle_jsonrpc_request(payload)
         if response is None:
-            self.send_response(204)
-            self.send_header("Connection", "close")
-            self.end_headers()
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                self.send_response(204)
+                self.send_header("Connection", "close")
+                self.end_headers()
             return
 
         self._send_json(200, response)
 
     def do_GET(self) -> None:
         self.close_connection = True
-        # Spec: only POST /mcp. Keep surface area tiny.
+        # The only endpoint is POST /mcp.
         self._send_text(404, "Not Found")
 
 
@@ -1812,7 +1979,7 @@ def start_server() -> bool:
     _state.server_thread = t
     t.start()
 
-    idaapi.msg(f"[IDA Fast MCP] Listening on http://{host}:{port}{MCP_ENDPOINT} (timeout {TOTAL_TIMEOUT_SECONDS:.0f}s)\n")
+    idaapi.msg(f"[IDA Fast MCP] Listening on http://{host}:{port}{MCP_ENDPOINT}\n")
     return True
 
 

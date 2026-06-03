@@ -11,11 +11,12 @@ MCP server for IDA Pro. Built for automated reverse engineering.
 
 Context is finite. Every token an LLM spends parsing tool names, reading descriptions, or processing bloated output is a token not spent reasoning about your binary.
 
-- **14 tools** — no redundancy, no overlap, clear verbs: `get_`, `list_`, `set_`, `find_`, `apply_`, `define_`
+- **15 tools** — no redundancy, no overlap, clear verbs (`get_`, `list_`, `find_`, `set_`, `apply_`, `define_`) plus one `run_python` escape hatch
 - **Tight tool descriptions** — unambiguous inputs and outputs, so the model picks the right tool and uses it correctly the first time
 - **Bounded outputs** — pagination on all lists, no context bombs
+- **Direct execution** — runs on IDA's main thread; no queue or worker pool, just request in, result out
 
-Every error doubles your token cost. This server is shaped to minimize them.
+Every error doubles your token cost. This server is shaped to minimize them. See [DESIGN.md](DESIGN.md) for goals and architecture.
 
 ## Install
 
@@ -32,7 +33,13 @@ Most clients just need the server URL in their MCP config. Example:
 }
 ```
 
-No dependencies. No subprocess spawning. No environment setup.
+No dependencies. No environment setup.
+
+## Execution model
+
+Every tool runs on IDA's main thread via `execute_sync()`, which already serializes all callers. There's no queue, worker pool, or cache to reason about — one request in, one JSON result out. A genuinely long operation (e.g. decompiling a pathological function) blocks until it finishes — inherent to IDA's single-threaded API. `run_python` additionally enforces a best-effort time limit that interrupts runaway Python loops.
+
+Transport is `POST /mcp` (JSON-RPC 2.0, one request per HTTP call).
 
 ## Tools
 
@@ -52,6 +59,7 @@ No dependencies. No subprocess spawning. No environment setup.
 | `set_comment` | Set comment at address |
 | `apply_type` | Apply type to address or local |
 | `define_type` | Parse C declaration into type library |
+| `run_python` | Escape hatch: run IDAPython when no dedicated tool fits |
 
 ## Config
 
