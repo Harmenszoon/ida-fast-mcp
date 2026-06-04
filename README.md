@@ -72,6 +72,7 @@ Environment variables (optional):
 ```
 IDA_FAST_MCP_HOST=127.0.0.1
 IDA_FAST_MCP_PORT=13338
+IDA_FAST_MCP_ALLOW_NONLOOPBACK=1   # opt in to a non-loopback bind (exposes RCE — see Security)
 ```
 
 ## Security
@@ -85,9 +86,13 @@ granted.
 
 What this stops: browser-driven requests (CSRF) and DNS-rebinding. What it does **not**
 stop: any other local process that can POST JSON — it sends no `Origin` and a loopback
-`Host`, so it passes every check and gets full power. The server binds loopback **by
-default**; binding a non-loopback address (via config) exposes that code execution to the
-network. Keep the bind address on loopback and use a local, non-browser MCP client.
+`Host`, so it passes every check and gets full power.
+
+The server binds loopback and **refuses a non-loopback bind** unless you explicitly set
+`IDA_FAST_MCP_ALLOW_NONLOOPBACK=1` (it falls back to `127.0.0.1` and logs why), because a
+network-reachable bind would be remote code execution — and the `Host` check is no defense
+there, since an attacker can simply send `Host: 127.0.0.1`. Keep the bind on loopback and
+use a local, non-browser MCP client.
 
 ## License
 

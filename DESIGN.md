@@ -65,5 +65,6 @@ must be `application/json`. No CORS is granted.
 
 These checks stop web pages and DNS-rebinding, **not** other local processes: a local
 non-browser process sends no `Origin` and a loopback `Host`, so it clears every check and
-has full power. The bind address defaults to loopback; pointing it at a non-loopback
-address exposes that code execution to the network. Keep it on loopback.
+has full power. The real network control is the bind address, not the `Host` check (an
+attacker can send `Host: 127.0.0.1`), so the server binds loopback and refuses a
+non-loopback bind unless `IDA_FAST_MCP_ALLOW_NONLOOPBACK=1` is set. Keep it on loopback.

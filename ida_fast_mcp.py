@@ -33,11 +33,14 @@ POST /mcp  (JSON-RPC 2.0 request/response; no SSE/streaming, no batch requests)
 
 Security
 --------
-For a single local user. Binds loopback by default, and every request is checked: the
-Host header must be loopback (defeats DNS rebinding), any browser Origin is rejected
-(legit MCP clients send none), and Content-Type must be application/json. No CORS is
-granted. There is NO authentication: run_python is full code execution by design, so any
-local process that can POST JSON has full power. Keep the bind address on loopback.
+For a single local user, with NO authentication: run_python is full code execution by
+design, so the HTTP layer is the entire trust boundary. The server binds loopback and
+refuses a non-loopback bind unless IDA_FAST_MCP_ALLOW_NONLOOPBACK is set, because a
+network-reachable bind would be remote code execution. Every request is also checked: the
+Host header must be loopback (defeats DNS rebinding), any browser Origin is rejected (legit
+MCP clients send none), and Content-Type must be application/json. These stop web pages and
+DNS-rebinding — not other local processes, which (no Origin, loopback Host) clear every
+check and have full power. Keep the bind on loopback.
 
 Install
 -------
@@ -48,6 +51,7 @@ Config
 Defaults to 127.0.0.1:13338. Override via environment or plugin options:
   IDA_FAST_MCP_HOST=127.0.0.1
   IDA_FAST_MCP_PORT=13338
+  IDA_FAST_MCP_ALLOW_NONLOOPBACK=1   (opt in to a non-loopback bind; exposes RCE)
   plugins.cfg:  ida_fast_mcp:host=127.0.0.1;port=13338
 """
 
@@ -2015,12 +2019,29 @@ def _parse_configuration() -> tuple[str, int]:
     return host, port
 
 
+def _is_loopback_host(host: str) -> bool:
+    """True only for addresses that stay on this machine. No DNS resolution — a hostname
+    that happens to resolve to a LAN address is treated as non-loopback on purpose."""
+    h = host.strip().strip("[]").lower()
+    return h in ("127.0.0.1", "::1", "localhost") or h.startswith("127.")
+
+
 def start_server() -> bool:
     if _state.http_server is not None:
         idaapi.msg("[IDA Fast MCP] Server already running\n")
         return True
 
     host, port = _parse_configuration()
+
+    # Secure by default: this endpoint runs arbitrary code with no authentication, so a
+    # non-loopback bind is network-reachable RCE. Refuse it unless explicitly opted in.
+    if not _is_loopback_host(host) and not _get_bool(os.environ.get("IDA_FAST_MCP_ALLOW_NONLOOPBACK", "")):
+        idaapi.msg(
+            f"[IDA Fast MCP] Refusing non-loopback bind host '{host}'; using {DEFAULT_HOST} instead. "
+            "This endpoint runs arbitrary code with no authentication. "
+            "Set IDA_FAST_MCP_ALLOW_NONLOOPBACK=1 to allow network binding.\n"
+        )
+        host = DEFAULT_HOST
 
     try:
         ThreadingHTTPServer.allow_reuse_address = True
