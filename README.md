@@ -50,8 +50,8 @@ Transport is `POST /mcp` (JSON-RPC 2.0, one request per HTTP call).
 |------|-------------|
 | `get_binary_info` | Binary metadata and segment list |
 | `get_function` | Decompiled pseudocode (falls back to disassembly) |
-| `get_xrefs` | Cross-references to address |
-| `get_pointer_table` | Read pointer table (vtable, jump table) |
+| `get_xrefs` | Inbound cross-references to an address |
+| `get_pointer_table` | Read an absolute pointer table (e.g. a vtable) |
 | `get_type` | Type definition by name |
 | `list_functions` | Functions (filterable by name, size) |
 | `list_strings` | Strings (filterable by content, length) |
@@ -79,7 +79,7 @@ IDA_FAST_MCP_ALLOW_NONLOOPBACK=1   # opt in to a non-loopback bind (exposes RCE 
 
 Built for a single local user. There is **no authentication**: `run_python` runs
 arbitrary IDAPython — code execution in the IDA process — so the HTTP layer is the entire
-trust boundary. Every request is validated: the `Host` header must be loopback (defeats DNS
+trust boundary. Every request is validated: any `Host` header must be loopback (defeats DNS
 rebinding), any `Origin` must be loopback so web pages can't drive it (legitimate
 non-browser MCP clients send none), and the body must be `application/json`. No CORS is
 granted.

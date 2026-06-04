@@ -58,7 +58,7 @@ symbol resolution, which touches the database) runs on IDA's main thread inside
 
 Single local user, loopback by default, and **no authentication**. `run_python` is full
 IDAPython execution — arbitrary code in the IDA process — so the HTTP layer is the trust
-boundary, not the snippet. Every request is checked before any work runs: the `Host` header
+boundary, not the snippet. Every request is checked before any work runs: any `Host` header
 must name loopback (defeats DNS rebinding), any `Origin` must be loopback (legitimate
 non-browser MCP clients send none, so this rejects browser-driven CSRF), and `Content-Type`
 must be `application/json`. No CORS is granted.
