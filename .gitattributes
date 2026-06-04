@@ -1,0 +1,4 @@
+# Normalize all text files to LF in the repository and on checkout,
+# matching .editorconfig (end_of_line = lf). Keeps line endings deterministic
+# across platforms and silences autocrlf conversion warnings.
+* text=auto eol=lf
