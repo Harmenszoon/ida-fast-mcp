@@ -1535,11 +1535,13 @@ def _tool_define_type(p: _Args) -> dict[str, Any]:
     if match:
         type_name = match.group(1)
     if not type_name:
-        match = re.search(r'\}\s*(\w+)\s*;', code)                  # typedef struct { ... } Name;
+        match = re.search(r'\}\s*\*?\s*(\w+)\s*;', code)            # typedef struct { ... } Name;
         if match:
             type_name = match.group(1)
     if not type_name:
-        match = re.search(r'typedef\s+\S+\s+(\w+)\s*;', code)       # typedef Type Name;
+        # typedef <anything> Name;  -> the last identifier (handles multi-word base types
+        # like 'unsigned int' and pointer typedefs 'struct FOO *PFOO'). Trailing ';' optional.
+        match = re.search(r'(\w+)\s*;?\s*$', code.strip())
         if match:
             type_name = match.group(1)
 
@@ -1747,7 +1749,10 @@ def _handle_tools_list(_params: dict[str, Any]) -> dict[str, Any]:
 
 def _handle_tools_call(params: dict[str, Any]) -> dict[str, Any]:
     tool_name = params.get("name") or ""
-    arguments = params.get("arguments") or {}
+    # Missing or null arguments means {}; a present non-object (e.g. a list) is rejected.
+    arguments = params.get("arguments")
+    if arguments is None:
+        arguments = {}
 
     if not tool_name:
         raise ValueError("Missing tool name")
@@ -1783,7 +1788,11 @@ def _handle_jsonrpc_request(payload: Any) -> dict[str, Any] | None:
         return fail(JsonRpcError.INVALID_REQUEST, "Invalid Request")
 
     method = payload.get("method")
-    params = payload.get("params") or {}
+    # Missing or null params means "no params" ({}); any other non-object is invalid
+    # (don't let `params: []` / 0 / "" coerce silently to {}).
+    params = payload.get("params")
+    if params is None:
+        params = {}
 
     if not isinstance(method, str):
         return fail(JsonRpcError.INVALID_REQUEST, "Invalid Request")
@@ -1913,8 +1922,10 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             return
 
         # Require a JSON content type; this also blocks simple cross-site form posts, which
-        # can only send text/plain, multipart/form-data, or urlencoded bodies.
-        if not self.headers.get("Content-Type", "").lower().startswith("application/json"):
+        # can only send text/plain, multipart/form-data, or urlencoded bodies. Compare the
+        # media type exactly (so "application/jsonx" is rejected), ignoring any ;charset.
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
             self._send_text(415, "Unsupported Media Type: expected application/json")
             return
 
