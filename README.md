@@ -15,6 +15,7 @@ Context is finite. Every token an LLM spends parsing tool names, reading descrip
 - **Tight tool descriptions** — unambiguous inputs and outputs, so the model picks the right tool and uses it correctly the first time
 - **Bounded outputs** — pagination on all lists, no context bombs
 - **Direct execution** — runs on IDA's main thread; no queue or worker pool, just request in, result out
+- **One declaration per tool** — each tool's parameters are declared once via typed descriptors; the JSON schema the model sees and the validation the server runs are *derived* from that single source, so they can never drift
 
 Every error doubles your token cost. This server is shaped to minimize them. See [DESIGN.md](DESIGN.md) for goals and architecture.
 
@@ -75,12 +76,18 @@ IDA_FAST_MCP_PORT=13338
 
 ## Security
 
-Built for a single local user. The server binds loopback only, and `run_python` runs
-arbitrary IDAPython — code execution in the IDA process — so the HTTP layer is the trust
-boundary. Every request is validated: the `Host` header must be loopback (defeats DNS
+Built for a single local user. There is **no authentication**: `run_python` runs
+arbitrary IDAPython — code execution in the IDA process — so the HTTP layer is the entire
+trust boundary. Every request is validated: the `Host` header must be loopback (defeats DNS
 rebinding), any `Origin` must be loopback so web pages can't drive it (legitimate
 non-browser MCP clients send none), and the body must be `application/json`. No CORS is
-granted. Use a local, non-browser MCP client and keep the bind address on loopback.
+granted.
+
+What this stops: browser-driven requests (CSRF) and DNS-rebinding. What it does **not**
+stop: any other local process that can POST JSON — it sends no `Origin` and a loopback
+`Host`, so it passes every check and gets full power. The server binds loopback **by
+default**; binding a non-loopback address (via config) exposes that code execution to the
+network. Keep the bind address on loopback and use a local, non-browser MCP client.
 
 ## License
 

@@ -36,6 +36,14 @@ native call still cannot be preempted.
 - **set_ / apply_ / define_**: `set_name`, `set_comment`, `apply_type`, `define_type`
 - **run_python**: escape hatch for IDAPython — only when no dedicated tool fits; terse, bounded output, time-limited
 
+Each tool is declared once. A `@tool` registration carries its parameter descriptors
+(`Addr`, `Int`, `Limit`, `Offset`, `Str`, `Enum`, `Names`, …), and a `ToolSpec` derives the
+JSON schema the model sees, the runtime validation the server runs, and the parsed/coerced
+arguments the handler receives — all from that single declaration. Schema and validation
+cannot drift, and adding a tool is one localized edit. All argument parsing (including
+symbol resolution, which touches the database) runs on IDA's main thread inside
+`execute_sync`.
+
 ## Conventions
 
 - Addresses are lowercase hex strings (`0x401000`); tools also accept symbol names.
@@ -48,10 +56,14 @@ native call still cannot be preempted.
 
 ## Security
 
-Single local user, loopback only. `run_python` is full IDAPython execution — arbitrary
-code in the IDA process — so the HTTP layer is the trust boundary, not the snippet. Every
-request is checked before any work runs: the `Host` header must name loopback (defeats DNS
-rebinding), any `Origin` must be loopback (legitimate non-browser MCP clients send none, so
-this rejects browser-driven CSRF), and `Content-Type` must be `application/json`. No CORS
-is granted. Other local processes and web pages therefore cannot drive the server — but
-anything that clears these checks has full power, so keep the bind address on loopback.
+Single local user, loopback by default, and **no authentication**. `run_python` is full
+IDAPython execution — arbitrary code in the IDA process — so the HTTP layer is the trust
+boundary, not the snippet. Every request is checked before any work runs: the `Host` header
+must name loopback (defeats DNS rebinding), any `Origin` must be loopback (legitimate
+non-browser MCP clients send none, so this rejects browser-driven CSRF), and `Content-Type`
+must be `application/json`. No CORS is granted.
+
+These checks stop web pages and DNS-rebinding, **not** other local processes: a local
+non-browser process sends no `Origin` and a loopback `Host`, so it clears every check and
+has full power. The bind address defaults to loopback; pointing it at a non-loopback
+address exposes that code execution to the network. Keep it on loopback.
