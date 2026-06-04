@@ -1,5 +1,5 @@
 """
-IDA Fast MCP — single-file MCP server for IDA Pro (v6.0.0)
+IDA Fast MCP — single-file MCP server for IDA Pro (v6.1.0)
 
 What this is
 ------------
@@ -23,6 +23,17 @@ Design
 - Bounded outputs: strict limits and deterministic pagination on every list.
 - Pseudocode first: decompile with per-line addresses; fall back to disassembly.
 
+Multiple IDA instances
+----------------------
+Open several IDAs at once and target any of them from one client. Each instance runs the
+full server on a private loopback worker port (first free in DEFAULT_PORT+1 .. +20). The
+instance that wins DEFAULT_PORT is the "router": the client connects there, calls
+list_instances to see the open binaries, and passes an optional `instance` argument
+(binary name, path, or pid) on any tool to choose where it runs. The router discovers peers
+by scanning the worker range for /whoami (no files, no registry) and proxies each call to
+the chosen instance, or runs it in-process when that instance is itself. With one IDA open
+it behaves exactly as before — `instance` is optional and defaults to the only instance.
+
 Compatibility
 -------------
 - IDA Pro 9.x with the Hex-Rays decompiler.
@@ -30,6 +41,7 @@ Compatibility
 Transport
 ---------
 POST /mcp  (JSON-RPC 2.0 request/response; no SSE/streaming, no batch requests)
+GET  /whoami  (cheap instance-identity probe used for discovery)
 
 Security
 --------
@@ -58,15 +70,19 @@ Defaults to 127.0.0.1:13338. Override via environment or plugin options:
 from __future__ import annotations
 
 import contextlib
+import http.client
 import json
 import os
+import random
 import re
+import socket
 import sys
 import threading
 import time
 import traceback
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import StringIO
 from typing import Any
@@ -94,11 +110,29 @@ import idc
 # Configuration & limits
 # =============================================================================
 
-VERSION = "6.0.0"
+VERSION = "6.1.0"
 MCP_ENDPOINT = "/mcp"
+WHOAMI_ENDPOINT = "/whoami"
+
+# Internal header the router stamps on a proxied call so the worker can verify it is still
+# the intended instance (defeats a port-reuse race where a dead instance's port is recycled).
+TARGET_PID_HEADER = "X-IDA-Fast-MCP-Target-Pid"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 13338
+
+# Multiple IDA instances: the client connects to the UNIFIED endpoint (DEFAULT_PORT). Every
+# instance also runs the full MCP server on a private WORKER port (the first free one in the
+# range [DEFAULT_PORT+1 .. +WORKER_PORT_COUNT], loopback only). The instance that wins the
+# unified port is the "router": it discovers peers by scanning the worker range and routes
+# each tool call to the chosen instance. See the "Multiple IDA instances" section below.
+WORKER_PORT_COUNT = 20            # cap on concurrently routable instances
+
+DISCOVERY_TIMEOUT = 0.35          # per-port connect+read budget when scanning for instances
+PROXY_TIMEOUT = 120.0             # long but finite: a proxied tool (e.g. a big decompile) may
+                                  # take a while, but a wedged worker must not strand a thread
+RECLAIM_INTERVAL = 1.5            # base delay between attempts to take over the unified port
+RECLAIM_JITTER = 1.5             # added random delay to avoid synchronized bind storms
 
 # Internal limits (named constants for maintainability)
 AVAILABLE_VARS_DISPLAY_MAX = 20
@@ -155,11 +189,40 @@ class Limits:
 
 @dataclass
 class _State:
-    http_server: ThreadingHTTPServer | None = None
-    server_thread: threading.Thread | None = None
+    # This instance's own worker server (the full single-DB MCP, like a standalone server).
+    worker_server: ThreadingHTTPServer | None = None
+    worker_thread: threading.Thread | None = None
+    worker_port: int | None = None
+    # The unified/router server, present only on the instance that currently owns DEFAULT_PORT.
+    router_server: ThreadingHTTPServer | None = None
+    router_thread: threading.Thread | None = None
+    # Background loop that tries to take over the unified port if this instance is not router.
+    reclaim_thread: threading.Thread | None = None
+    stopping: bool = False
+    # Unified endpoint host/port (where the client connects); workers are always loopback.
+    unified_host: str = DEFAULT_HOST
+    unified_port: int = DEFAULT_PORT
+    # Cached identity for /whoami, captured on IDA's main thread (never queried live).
+    identity: dict[str, Any] = field(default_factory=dict)
 
 
 _state = _State()
+
+
+def _capture_identity() -> dict[str, Any]:
+    """Snapshot this instance's identity. Must run on IDA's main thread (touches the DB).
+
+    /whoami serves this cache and never calls into IDA, so discovery can't block behind a
+    long-running operation.
+    """
+    return {
+        "server": "IDA Fast MCP",
+        "version": VERSION,
+        "pid": os.getpid(),
+        "binary": ida_nalt.get_root_filename() or "",
+        "path": ida_nalt.get_input_file_path() or "",
+        "worker_port": _state.worker_port,
+    }
 
 
 def _build_python_namespace() -> dict[str, Any]:
@@ -1747,8 +1810,10 @@ def _handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _handle_tools_list(_params: dict[str, Any]) -> dict[str, Any]:
-    return {"tools": TOOL_DESCRIPTORS}
+def _handle_tools_list(_params: dict[str, Any], *, router: bool = False) -> dict[str, Any]:
+    # The router advertises the same tools with an optional `instance` selector injected,
+    # plus the router-only list_instances tool. Workers advertise the plain tool set.
+    return {"tools": _router_tool_descriptors() if router else TOOL_DESCRIPTORS}
 
 
 def _handle_tools_call(params: dict[str, Any]) -> dict[str, Any]:
@@ -1776,9 +1841,11 @@ def _handle_prompts_list(_params: dict[str, Any]) -> dict[str, Any]:
     return {"prompts": []}
 
 
-def _handle_jsonrpc_request(payload: Any) -> dict[str, Any] | None:
+def _handle_jsonrpc_request(payload: Any, *, router: bool = False) -> dict[str, Any] | None:
     # A request without "id" is a notification: per JSON-RPC we send no response at all,
     # not even on error. (A non-dict payload has no id and is treated as a real error.)
+    # router=True means this is the unified endpoint: tools/call is routed to the chosen
+    # instance and tools/list is augmented with the `instance` selector.
     req_id = payload.get("id") if isinstance(payload, dict) else None
     is_notification = isinstance(payload, dict) and ("id" not in payload)
 
@@ -1812,8 +1879,13 @@ def _handle_jsonrpc_request(payload: Any) -> dict[str, Any] | None:
         if method == "initialize":
             result = _handle_initialize(params)
         elif method == "tools/list":
-            result = _handle_tools_list(params)
+            result = _handle_tools_list(params, router=router)
         elif method == "tools/call":
+            if router:
+                # Routing may relay a worker's complete JSON-RPC response verbatim, so it
+                # returns a full response object rather than a bare result to wrap.
+                resp = _route_tools_call(req_id, params)
+                return None if is_notification else resp
             result = _handle_tools_call(params)
         elif method == "resources/list":
             result = _handle_resources_list(params)
@@ -1836,8 +1908,244 @@ def _handle_jsonrpc_request(payload: Any) -> dict[str, Any] | None:
 
 
 # =============================================================================
+# Multiple IDA instances: discovery, selection, and routing
+#
+# Every instance runs the full MCP server on a private worker port. The instance that owns
+# the unified port (DEFAULT_PORT) is the "router": it discovers peers by scanning the worker
+# range for /whoami, exposes list_instances, injects an optional `instance` selector into
+# every tool, and routes each tool call to the chosen instance — proxying over loopback HTTP,
+# or short-circuiting in-process when the target is itself. The 15 tools are unchanged; this
+# is a thin layer in front of them.
+# =============================================================================
+
+# Optional selector injected into every tool's advertised schema by the router.
+_INSTANCE_PROP: dict[str, Any] = {
+    "type": "string",
+    "description": "Target IDA instance: binary name (when unique), file path, or pid from "
+                   "list_instances. Omit when only one instance is open.",
+}
+
+_LIST_INSTANCES_DESCRIPTOR: dict[str, Any] = {
+    "name": "list_instances",
+    "description": "List the open IDA instances (binary name, path, pid, version). Pass an "
+                   "instance's name (or pid) as the `instance` argument to target any other "
+                   "tool at it. With one instance open, `instance` can be omitted.",
+    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+}
+
+
+def _router_tool_descriptors() -> list[dict[str, Any]]:
+    """The unified tool list: every tool gains an optional `instance`, plus list_instances."""
+    out: list[dict[str, Any]] = []
+    for d in TOOL_DESCRIPTORS:
+        schema = d["inputSchema"]
+        props = {**schema.get("properties", {}), "instance": _INSTANCE_PROP}
+        out.append({**d, "inputSchema": {**schema, "properties": props}})
+    out.append(_LIST_INSTANCES_DESCRIPTOR)
+    return out
+
+
+# Short-TTL cache so a burst of routed calls doesn't rescan for each one; list_instances
+# always scans fresh.
+_scan_lock = threading.Lock()
+_scan_cache: dict[str, Any] = {"ts": 0.0, "data": []}
+
+
+def _query_whoami(port: int) -> dict[str, Any] | None:
+    """Probe one worker port. Returns its identity only if it is genuinely one of us."""
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=DISCOVERY_TIMEOUT)
+        try:
+            conn.request("GET", WHOAMI_ENDPOINT)
+            resp = conn.getresponse()
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read())
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - a dead/refused port or a non-HTTP service is just "not us"
+        return None
+    # Require the marker so a random local service on a range port is never mistaken for us.
+    if (isinstance(data, dict) and data.get("server") == "IDA Fast MCP"
+            and isinstance(data.get("pid"), int) and isinstance(data.get("worker_port"), int)):
+        return data
+    return None
+
+
+def _scan_instances() -> list[dict[str, Any]]:
+    """Discover live instances by scanning the worker port range. The OS port table is the
+    registry — no files, no stale state; a dead instance simply isn't there.
+
+    Probes run in parallel: a dead/filtered port can cost the full DISCOVERY_TIMEOUT (some
+    systems don't refuse a closed loopback port immediately), so a serial scan over the whole
+    range would be slow. In parallel the scan costs ~one timeout regardless of range size.
+    """
+    base = _state.unified_port + 1
+    ports = list(range(base, base + WORKER_PORT_COUNT))
+    with ThreadPoolExecutor(max_workers=len(ports)) as pool:
+        results = pool.map(_query_whoami, ports)
+    found = [ident for ident in results if ident is not None]
+    found.sort(key=lambda i: ((i.get("binary") or "").lower(), i.get("pid", 0)))
+    return found
+
+
+def _scan_instances_cached() -> list[dict[str, Any]]:
+    with _scan_lock:
+        now = time.monotonic()
+        if now - _scan_cache["ts"] < 1.0 and _scan_cache["data"]:
+            return _scan_cache["data"]
+        data = _scan_instances()
+        _scan_cache.update(ts=now, data=data)
+        return data
+
+
+def _format_instances(instances: list[dict[str, Any]]) -> str:
+    return ", ".join(f"{i.get('binary') or '(no binary)'} (pid {i.get('pid')})" for i in instances)
+
+
+def _path_matches(path: str, selector: str) -> bool:
+    if not path:
+        return False
+    a = os.path.normcase(os.path.normpath(path))
+    b = os.path.normcase(os.path.normpath(selector))
+    return a == b
+
+
+def _resolve_target(selector: Any, instances: list[dict[str, Any]]) -> dict[str, Any]:
+    """Resolve an `instance` selector to exactly one instance, or raise a telepathic error.
+
+    Selector may be a binary name (or stem), a file path, or a pid. Resolution is
+    collision-aware: a token that matches different instances by different modes is ambiguous
+    unless every match is the same instance.
+    """
+    if not instances:
+        raise ValueError("No IDA instances are reachable. Rerun list_instances.")
+
+    if selector is None or (isinstance(selector, str) and not selector.strip()):
+        if len(instances) == 1:
+            return instances[0]
+        raise ValueError(
+            f"Multiple IDA instances are open; pass instance=<binary name or pid>. "
+            f"Open: {_format_instances(instances)}."
+        )
+
+    sel = str(selector).strip()
+    sel_l = sel.lower()
+    matched: dict[int, dict[str, Any]] = {}
+    for inst in instances:
+        name = inst.get("binary") or ""
+        stem = name.rsplit(".", 1)[0] if "." in name else name
+        by_name = bool(name) and (name.lower() == sel_l or stem.lower() == sel_l)
+        by_pid = sel.isdigit() and inst.get("pid") == int(sel)
+        by_path = _path_matches(inst.get("path") or "", sel)
+        if by_name or by_pid or by_path:
+            matched[inst.get("pid")] = inst
+
+    if len(matched) == 1:
+        return next(iter(matched.values()))
+    if not matched:
+        raise ValueError(f"No open instance matches '{sel}'. Open: {_format_instances(instances)}.")
+    raise ValueError(
+        f"'{sel}' is ambiguous across instances: {_format_instances(list(matched.values()))}. "
+        f"Pass the pid to disambiguate."
+    )
+
+
+def _list_instances_result() -> dict[str, Any]:
+    rows = [
+        {"name": i.get("binary") or None, "path": i.get("path") or None,
+         "pid": i.get("pid"), "version": i.get("version")}
+        for i in _scan_instances()
+    ]
+    return _tool_success({"instances": rows, "count": len(rows)})
+
+
+def _proxy_tools_call(target: dict[str, Any], req_id: Any, name: str,
+                      arguments: dict[str, Any]) -> dict[str, Any]:
+    """Forward a tool call to another instance's worker port and relay its JSON-RPC response.
+
+    The target-pid header lets the worker reject the call if its port has since been recycled
+    by a different process (a reuse race), so a call can never silently hit the wrong DB.
+    """
+    payload = {"jsonrpc": "2.0", "id": req_id, "method": "tools/call",
+               "params": {"name": name, "arguments": arguments}}
+    body = json.dumps(payload).encode("utf-8")
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", target["worker_port"], timeout=PROXY_TIMEOUT)
+        try:
+            conn.request("POST", MCP_ENDPOINT, body, headers={
+                "Content-Type": "application/json",
+                TARGET_PID_HEADER: str(target["pid"]),
+            })
+            resp = conn.getresponse()
+            data = resp.read()
+        finally:
+            conn.close()
+        return json.loads(data)
+    except Exception as e:  # noqa: BLE001 - any proxy failure becomes a clean, actionable error
+        with _scan_lock:
+            _scan_cache["ts"] = 0.0  # this target looks gone; force a rescan next time
+        return _jsonrpc_result(req_id, _tool_error(
+            f"Instance '{target.get('binary') or target.get('pid')}' (pid {target.get('pid')}) "
+            f"is unreachable: {type(e).__name__}. Rerun list_instances."
+        ))
+
+
+def _route_tools_call(req_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Unified-endpoint tools/call: select the target instance and dispatch to it."""
+    name = params.get("name") or ""
+    arguments = params.get("arguments")
+    if arguments is None:
+        arguments = {}
+    if not name:
+        return _jsonrpc_error(req_id, JsonRpcError.INVALID_PARAMS, "Missing tool name")
+    if not isinstance(arguments, dict):
+        return _jsonrpc_error(req_id, JsonRpcError.INVALID_PARAMS, "Tool arguments must be an object")
+
+    # Router-native, never proxied.
+    if name == "list_instances":
+        return _jsonrpc_result(req_id, _list_instances_result())
+
+    if name not in _TOOLS:
+        return _jsonrpc_result(req_id, _tool_error(f"Unknown tool: {name}"))
+
+    # The selector is a routing concern; strip it before the backend (whose schema forbids it).
+    selector = arguments.get("instance")
+    clean_args = {k: v for k, v in arguments.items() if k != "instance"}
+
+    try:
+        target = _resolve_target(selector, _scan_instances_cached())
+    except ValueError as e:
+        # Selection problems are returned as tool errors so the agent sees and self-corrects.
+        return _jsonrpc_result(req_id, _tool_error(str(e)))
+
+    if target.get("pid") == os.getpid():
+        return _jsonrpc_result(req_id, _execute_tool(name, clean_args))  # in-process, no hop
+    return _proxy_tools_call(target, req_id, name, clean_args)
+
+
+# =============================================================================
 # HTTP server
 # =============================================================================
+
+class _MCPServer(ThreadingHTTPServer):
+    """Threaded HTTP server with EXCLUSIVE port ownership.
+
+    No SO_REUSEADDR (and SO_EXCLUSIVEADDRUSE on Windows) so exactly one process can hold a
+    port: this makes the unified-port election unambiguous and prevents another process from
+    hijacking a worker/router port. `role` is "router" (unified endpoint) or "worker".
+    """
+
+    daemon_threads = True
+    allow_reuse_address = False
+    role = "worker"
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            with contextlib.suppress(OSError):
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
 
 class MCPRequestHandler(BaseHTTPRequestHandler):
     """HTTP handler for MCP Streamable HTTP endpoint."""
@@ -1965,7 +2273,20 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, _jsonrpc_error(None, JsonRpcError.INVALID_REQUEST, "Batch requests not supported."))
             return
 
-        response = _handle_jsonrpc_request(payload)
+        role = getattr(self.server, "role", "worker")
+
+        # Worker role: if the router stamped a target pid that isn't us, the port was recycled
+        # under a different process. Reject so a call never silently lands on the wrong DB.
+        if role == "worker":
+            want_pid = self.headers.get(TARGET_PID_HEADER)
+            if want_pid and want_pid.strip() != str(os.getpid()):
+                req_id = payload.get("id") if isinstance(payload, dict) else None
+                self._send_json(200, _jsonrpc_result(req_id, _tool_error(
+                    f"This port now hosts pid {os.getpid()}, not {want_pid.strip()}; "
+                    "the instance changed. Rerun list_instances.")))
+                return
+
+        response = _handle_jsonrpc_request(payload, router=(role == "router"))
         if response is None:
             # Accepted notification with no reply body (MCP Streamable HTTP: 202 Accepted).
             self._respond(202)
@@ -1974,6 +2295,14 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         self._send_json(200, response)
 
     def do_GET(self) -> None:
+        # Discovery: a cheap identity probe served from cache (never calls into IDA, so it
+        # can't block behind a long operation). Loopback-guarded like every other request.
+        if self.path == WHOAMI_ENDPOINT:
+            if not self._request_is_allowed():
+                self._send_text(403, "Forbidden")
+                return
+            self._send_json(200, dict(_state.identity))
+            return
         if self.path != MCP_ENDPOINT:
             self._send_text(404, "Not Found")
             return
@@ -2026,66 +2355,136 @@ def _is_loopback_host(host: str) -> bool:
     return h in ("127.0.0.1", "::1", "localhost") or h.startswith("127.")
 
 
-def start_server() -> bool:
-    if _state.http_server is not None:
-        idaapi.msg("[IDA Fast MCP] Server already running\n")
-        return True
-
-    host, port = _parse_configuration()
-
-    # Secure by default: this endpoint runs arbitrary code with no authentication, so a
-    # non-loopback bind is network-reachable RCE. Refuse it unless explicitly opted in.
+def _guarded_unified_host(host: str) -> str:
+    """Secure by default: refuse a non-loopback unified bind (network-reachable RCE) unless
+    explicitly opted in. Worker ports are always loopback regardless."""
     if not _is_loopback_host(host) and not _get_bool(os.environ.get("IDA_FAST_MCP_ALLOW_NONLOOPBACK", "")):
         idaapi.msg(
             f"[IDA Fast MCP] Refusing non-loopback bind host '{host}'; using {DEFAULT_HOST} instead. "
             "This endpoint runs arbitrary code with no authentication. "
             "Set IDA_FAST_MCP_ALLOW_NONLOOPBACK=1 to allow network binding.\n"
         )
-        host = DEFAULT_HOST
+        return DEFAULT_HOST
+    return host
 
-    try:
-        ThreadingHTTPServer.allow_reuse_address = True
-        server = ThreadingHTTPServer((host, port), MCPRequestHandler)
-        server.daemon_threads = True
-    except OSError as e:
-        idaapi.msg(f"[IDA Fast MCP] Failed to bind {host}:{port}: {e}\n")
-        return False
-    except Exception as e:
-        idaapi.msg(f"[IDA Fast MCP] Server init failed: {type(e).__name__}: {e}\n")
-        return False
 
-    _state.http_server = server
-
+def _serve_in_thread(server: _MCPServer, name: str) -> threading.Thread:
     def _serve() -> None:
         with contextlib.suppress(Exception):
             server.serve_forever(poll_interval=0.25)
 
-    t = threading.Thread(target=_serve, name="IDAFastMCP_HTTPServer", daemon=True)
-    _state.server_thread = t
+    t = threading.Thread(target=_serve, name=f"IDAFastMCP_{name}", daemon=True)
     t.start()
+    return t
 
-    idaapi.msg(f"[IDA Fast MCP] Listening on http://{host}:{port}{MCP_ENDPOINT}\n")
+
+def _bind_worker(base: int) -> tuple[_MCPServer | None, int | None]:
+    """Bind the first free worker port in the range (loopback only, exclusive)."""
+    for port in range(base, base + WORKER_PORT_COUNT):
+        try:
+            server = _MCPServer((DEFAULT_HOST, port), MCPRequestHandler)
+        except OSError:
+            continue  # taken by another instance; try the next slot
+        server.role = "worker"
+        return server, port
+    return None, None
+
+
+def _try_become_router() -> bool:
+    """Attempt to claim the unified port. Exactly one instance can win (exclusive bind)."""
+    if _state.router_server is not None:
+        return True
+    try:
+        server = _MCPServer((_state.unified_host, _state.unified_port), MCPRequestHandler)
+    except OSError:
+        return False  # another instance holds it
+    server.role = "router"
+    _state.router_server = server
+    _state.router_thread = _serve_in_thread(server, "router")
+    return True
+
+
+def _start_reclaim_loop() -> None:
+    """Another instance is the router; keep trying to take over so the unified endpoint
+    survives that instance closing (failover). Jittered to avoid synchronized bind storms."""
+    if _state.reclaim_thread is not None and _state.reclaim_thread.is_alive():
+        return
+
+    def _loop() -> None:
+        while not _state.stopping and _state.router_server is None:
+            time.sleep(RECLAIM_INTERVAL + random.uniform(0.0, RECLAIM_JITTER))
+            if _state.stopping or _state.router_server is not None:
+                break
+            if _try_become_router():
+                idaapi.msg("[IDA Fast MCP] Took over the unified endpoint "
+                           f"http://{_state.unified_host}:{_state.unified_port}{MCP_ENDPOINT}\n")
+                break
+
+    _state.reclaim_thread = threading.Thread(target=_loop, name="IDAFastMCP_Reclaim", daemon=True)
+    _state.reclaim_thread.start()
+
+
+def start_server() -> bool:
+    if _state.worker_server is not None:
+        idaapi.msg("[IDA Fast MCP] Server already running\n")
+        return True
+
+    host, port = _parse_configuration()
+    _state.unified_host = _guarded_unified_host(host)
+    _state.unified_port = port
+    _state.stopping = False
+
+    # Every instance is reachable on its own loopback worker port (the full single-DB server).
+    worker_server, worker_port = _bind_worker(port + 1)
+    if worker_server is None:
+        idaapi.msg(
+            f"[IDA Fast MCP] No free worker port in {port + 1}-{port + WORKER_PORT_COUNT}; "
+            "close an IDA instance or change IDA_FAST_MCP_PORT. This instance will not serve.\n"
+        )
+        return False
+
+    _state.worker_server = worker_server
+    _state.worker_port = worker_port
+    _state.identity = _capture_identity()  # on IDA's main thread (init/run run there)
+    _state.worker_thread = _serve_in_thread(worker_server, "worker")
+
+    # Contend for the unified endpoint; if another instance holds it, watch for a handover.
+    became_router = _try_become_router()
+    if not became_router:
+        _start_reclaim_loop()
+
+    binary = _state.identity.get("binary") or "(no binary)"
+    served_by = "this instance" if became_router else "another instance"
+    idaapi.msg(
+        f"[IDA Fast MCP] {binary}: worker on 127.0.0.1:{worker_port}; unified endpoint "
+        f"http://{_state.unified_host}:{_state.unified_port}{MCP_ENDPOINT} (served by {served_by}).\n"
+    )
     return True
 
 
 def stop_server() -> None:
-    server = _state.http_server
-    if not server:
+    if _state.worker_server is None and _state.router_server is None:
         return
 
-    _state.http_server = None
+    _state.stopping = True
 
-    with contextlib.suppress(Exception):
-        server.shutdown()
-    with contextlib.suppress(Exception):
-        server.server_close()
+    for attr in ("router_server", "worker_server"):
+        server = getattr(_state, attr)
+        setattr(_state, attr, None)
+        if server is not None:
+            with contextlib.suppress(Exception):
+                server.shutdown()
+            with contextlib.suppress(Exception):
+                server.server_close()
 
-    t = _state.server_thread
-    _state.server_thread = None
-    if t:
-        with contextlib.suppress(Exception):
-            t.join(timeout=1.0)
+    for attr in ("router_thread", "worker_thread", "reclaim_thread"):
+        thread = getattr(_state, attr)
+        setattr(_state, attr, None)
+        if thread is not None:
+            with contextlib.suppress(Exception):
+                thread.join(timeout=1.0)
 
+    _state.worker_port = None
     idaapi.msg("[IDA Fast MCP] Server stopped\n")
 
 
@@ -2106,7 +2505,7 @@ class IDAFastMCPPlugin(idaapi.plugin_t):
 
     def run(self, _arg: int) -> None:
         # Toggle server
-        if _state.http_server is None:
+        if _state.worker_server is None:
             start_server()
         else:
             stop_server()

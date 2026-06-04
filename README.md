@@ -16,6 +16,7 @@ Context is finite. Every token an LLM spends parsing tool names, reading descrip
 - **Bounded outputs** — pagination on all lists, no context bombs
 - **Direct execution** — runs on IDA's main thread; no queue or worker pool, just request in, result out
 - **One declaration per tool** — each tool's parameters are declared once via typed descriptors; the JSON schema the model sees and the validation the server runs are *derived* from that single source, so they can never drift
+- **Multiple IDA instances** — open several IDAs and target any of them from one client by binary name; no extra config, no per-instance ports to wire up
 
 Every error doubles your token cost. This server is shaped to minimize them. See [DESIGN.md](DESIGN.md) for goals and architecture.
 
@@ -63,6 +64,21 @@ Transport is `POST /mcp` (JSON-RPC 2.0, one request per HTTP call).
 | `apply_type` | Apply type to address or local |
 | `define_type` | Parse C declaration into type library |
 | `run_python` | Escape hatch: run IDAPython when no dedicated tool fits |
+| `list_instances` | List open IDA instances for multi-instance routing |
+
+## Multiple IDA instances
+
+Open as many IDA instances as you like — they coordinate automatically. The client still
+connects to the single URL; nothing to configure per instance.
+
+- Call `list_instances` to see the open binaries (`name`, `path`, `pid`).
+- Pass an optional `instance` argument (a **binary name**, path, or pid) on any tool to
+  choose where it runs — e.g. `get_function(instance="kernel32.dll", address=…)`.
+- With one IDA open, `instance` is optional and everything works exactly as before.
+
+Under the hood: each instance serves on a private loopback port; the one holding the main
+port routes calls to the others and takes over automatically if it closes. No registry, no
+broker, no extra processes.
 
 ## Config
 

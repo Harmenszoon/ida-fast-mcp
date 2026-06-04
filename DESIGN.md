@@ -35,6 +35,7 @@ native call still cannot be preempted.
 - **find_**: `find_pattern`
 - **set_ / apply_ / define_**: `set_name`, `set_comment`, `apply_type`, `define_type`
 - **run_python**: escape hatch for IDAPython — only when no dedicated tool fits; terse, bounded output, time-limited
+- **list_instances**: only on the unified endpoint — lists the open IDA instances so a call can be routed by binary name
 
 Each tool is declared once. A `@tool` registration carries its parameter descriptors
 (`Addr`, `Int`, `Limit`, `Offset`, `Str`, `Enum`, `Names`, …), and a `ToolSpec` derives the
@@ -43,6 +44,27 @@ arguments the handler receives — all from that single declaration. Schema and 
 cannot drift, and adding a tool is one localized edit. All argument parsing (including
 symbol resolution, which touches the database) runs on IDA's main thread inside
 `execute_sync`.
+
+## Multiple IDA instances
+
+The client connects to one endpoint and targets any open IDA from it. A routing layer wraps
+the unchanged single-instance server:
+
+- **Workers.** Every instance runs the full server on its own loopback port — the first free
+  one in `DEFAULT_PORT+1 .. +20`.
+- **Router.** Whoever wins `DEFAULT_PORT` (exclusive bind) is the router. It injects an
+  optional `instance` selector into every tool, serves `list_instances`, and routes each
+  `tools/call` to the chosen instance — proxying over loopback, or running it in-process when
+  the target is itself. If the router's IDA closes, a survivor takes the port (a jittered
+  re-claim loop); the brief gap self-heals and the client retries.
+- **Discovery is the OS port table.** The router scans the worker range for a `/whoami`
+  identity probe — no files, no registry, nothing stale to clean up. A proxied call carries
+  the target pid so a recycled port can never misroute to a different instance.
+- **Selection is by binary name** (path or pid disambiguate collisions). One instance open →
+  `instance` is optional and behavior is identical to a single server.
+
+This is the one place the server keeps more than trivial state; it is isolated in front of
+the tools, which are untouched.
 
 ## Conventions
 
