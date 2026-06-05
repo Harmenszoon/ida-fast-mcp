@@ -60,7 +60,7 @@ the unchanged single-instance server:
   re-claim loop); the brief gap self-heals and the client retries.
 - **Discovery is the OS port table.** The router scans the worker range for a `/whoami`
   identity probe — no files, no registry, nothing stale to clean up. A proxied call carries
-  the target pid so a recycled port can never misroute to a different instance.
+  the target's per-process token so a recycled port can never misroute to a different instance.
 - **Selection is by binary name** (path or pid disambiguate collisions). One instance open →
   `instance` is optional and behavior is identical to a single server.
 

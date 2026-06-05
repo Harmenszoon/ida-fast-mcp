@@ -2042,8 +2042,8 @@ def _resolve_target(selector: Any, instances: list[dict[str, Any]]) -> dict[str,
     """Resolve an `instance` selector to exactly one instance, or raise a telepathic error.
 
     Selector may be a binary name (or stem), a file path, or a pid. Resolution is
-    collision-aware: a token that matches different instances by different modes is ambiguous
-    unless every match is the same instance.
+    collision-aware: a selector that matches different instances by different modes is
+    ambiguous unless every match is the same instance.
     """
     if not instances:
         raise ValueError("No IDA instances are reachable. Rerun list_instances.")
