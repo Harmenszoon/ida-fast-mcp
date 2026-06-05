@@ -133,6 +133,8 @@ PROXY_TIMEOUT = 120.0             # long but finite: a proxied tool (e.g. a big 
                                   # take a while, but a wedged worker must not strand a thread
 RECLAIM_INTERVAL = 1.5            # base delay between attempts to take over the unified port
 RECLAIM_JITTER = 1.5             # added random delay to avoid synchronized bind storms
+IDENTITY_REFRESH_MS = 2000        # how often each instance re-reads its binary name on the
+                                  # main thread (the DB often loads AFTER the plugin's init)
 
 # Internal limits (named constants for maintainability)
 AVAILABLE_VARS_DISPLAY_MAX = 20
@@ -204,6 +206,7 @@ class _State:
     unified_port: int = DEFAULT_PORT
     # Cached identity for /whoami, captured on IDA's main thread (never queried live).
     identity: dict[str, Any] = field(default_factory=dict)
+    identity_timer: Any = None
 
 
 _state = _State()
@@ -223,6 +226,22 @@ def _capture_identity() -> dict[str, Any]:
         "path": ida_nalt.get_input_file_path() or "",
         "worker_port": _state.worker_port,
     }
+
+
+def _refresh_identity() -> int:
+    """IDA timer callback (runs on the main thread): keep the cached binary name current.
+
+    The plugin's init() runs at IDA startup — often before a database is open — so the name
+    captured then is empty. Re-reading on a timer fills it in once the DB loads (and tracks a
+    later file change). Returns the next interval in ms, or -1 to stop the timer.
+    """
+    if _state.stopping or _state.worker_server is None:
+        return -1
+    if _state.identity:
+        with contextlib.suppress(Exception):
+            _state.identity["binary"] = ida_nalt.get_root_filename() or ""
+            _state.identity["path"] = ida_nalt.get_input_file_path() or ""
+    return IDENTITY_REFRESH_MS
 
 
 def _build_python_namespace() -> dict[str, Any]:
@@ -2446,6 +2465,9 @@ def start_server() -> bool:
     _state.worker_server = worker_server
     _state.worker_port = worker_port
     _state.identity = _capture_identity()  # on IDA's main thread (init/run run there)
+    # The DB is often not open yet at init; keep the binary name current on the main thread.
+    with contextlib.suppress(Exception):
+        _state.identity_timer = ida_kernwin.register_timer(IDENTITY_REFRESH_MS, _refresh_identity)
     _state.worker_thread = _serve_in_thread(worker_server, "worker")
 
     # Contend for the unified endpoint; if another instance holds it, watch for a handover.
@@ -2467,6 +2489,11 @@ def stop_server() -> None:
         return
 
     _state.stopping = True
+
+    if _state.identity_timer is not None:
+        with contextlib.suppress(Exception):
+            ida_kernwin.unregister_timer(_state.identity_timer)
+        _state.identity_timer = None
 
     for attr in ("router_server", "worker_server"):
         server = getattr(_state, attr)
