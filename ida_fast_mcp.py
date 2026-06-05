@@ -75,6 +75,7 @@ import json
 import os
 import random
 import re
+import secrets
 import socket
 import sys
 import threading
@@ -114,9 +115,11 @@ VERSION = "6.1.0"
 MCP_ENDPOINT = "/mcp"
 WHOAMI_ENDPOINT = "/whoami"
 
-# Internal header the router stamps on a proxied call so the worker can verify it is still
-# the intended instance (defeats a port-reuse race where a dead instance's port is recycled).
-TARGET_PID_HEADER = "X-IDA-Fast-MCP-Target-Pid"
+# A per-process random token. The router stamps the chosen instance's token on each proxied
+# call and the worker rejects a mismatch, so a call can never land on a different process even
+# if a worker port is recycled — a recycled port cannot forge another instance's fresh token.
+INSTANCE_HEADER = "X-IDA-Fast-MCP-Instance"
+INSTANCE_TOKEN = secrets.token_hex(8)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 13338
@@ -201,6 +204,9 @@ class _State:
     # Background loop that tries to take over the unified port if this instance is not router.
     reclaim_thread: threading.Thread | None = None
     stopping: bool = False
+    # Signalled on teardown so the reclaim loop wakes immediately (no stale thread across a
+    # quick stop/start). Replaced with a fresh event on each start so generations never mix.
+    stop_event: threading.Event = field(default_factory=threading.Event)
     # Unified endpoint host/port (where the client connects); workers are always loopback.
     unified_host: str = DEFAULT_HOST
     unified_port: int = DEFAULT_PORT
@@ -222,6 +228,7 @@ def _capture_identity() -> dict[str, Any]:
         "server": "IDA Fast MCP",
         "version": VERSION,
         "pid": os.getpid(),
+        "token": INSTANCE_TOKEN,
         "binary": ida_nalt.get_root_filename() or "",
         "path": ida_nalt.get_input_file_path() or "",
         "worker_port": _state.worker_port,
@@ -1986,7 +1993,8 @@ def _query_whoami(port: int) -> dict[str, Any] | None:
         return None
     # Require the marker so a random local service on a range port is never mistaken for us.
     if (isinstance(data, dict) and data.get("server") == "IDA Fast MCP"
-            and isinstance(data.get("pid"), int) and isinstance(data.get("worker_port"), int)):
+            and isinstance(data.get("pid"), int) and isinstance(data.get("worker_port"), int)
+            and isinstance(data.get("token"), str)):
         return data
     return None
 
@@ -2083,8 +2091,8 @@ def _proxy_tools_call(target: dict[str, Any], req_id: Any, name: str,
                       arguments: dict[str, Any]) -> dict[str, Any]:
     """Forward a tool call to another instance's worker port and relay its JSON-RPC response.
 
-    The target-pid header lets the worker reject the call if its port has since been recycled
-    by a different process (a reuse race), so a call can never silently hit the wrong DB.
+    The instance token lets the worker reject the call if its port has since been recycled by a
+    different process (a reuse race), so a call can never silently hit the wrong database.
     """
     payload = {"jsonrpc": "2.0", "id": req_id, "method": "tools/call",
                "params": {"name": name, "arguments": arguments}}
@@ -2094,7 +2102,7 @@ def _proxy_tools_call(target: dict[str, Any], req_id: Any, name: str,
         try:
             conn.request("POST", MCP_ENDPOINT, body, headers={
                 "Content-Type": "application/json",
-                TARGET_PID_HEADER: str(target["pid"]),
+                INSTANCE_HEADER: str(target.get("token", "")),
             })
             resp = conn.getresponse()
             data = resp.read()
@@ -2126,7 +2134,8 @@ def _route_tools_call(req_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         return _jsonrpc_result(req_id, _list_instances_result())
 
     if name not in _TOOLS:
-        return _jsonrpc_result(req_id, _tool_error(f"Unknown tool: {name}"))
+        # Match the worker/single-instance path, which reports an unknown tool as INVALID_PARAMS.
+        return _jsonrpc_error(req_id, JsonRpcError.INVALID_PARAMS, f"Unknown tool: {name}")
 
     # The selector is a routing concern; strip it before the backend (whose schema forbids it).
     selector = arguments.get("instance")
@@ -2294,15 +2303,15 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
         role = getattr(self.server, "role", "worker")
 
-        # Worker role: if the router stamped a target pid that isn't us, the port was recycled
+        # Worker role: if the router stamped a token that isn't ours, this port was recycled
         # under a different process. Reject so a call never silently lands on the wrong DB.
         if role == "worker":
-            want_pid = self.headers.get(TARGET_PID_HEADER)
-            if want_pid and want_pid.strip() != str(os.getpid()):
+            want = self.headers.get(INSTANCE_HEADER)
+            if want and want != INSTANCE_TOKEN:
                 req_id = payload.get("id") if isinstance(payload, dict) else None
                 self._send_json(200, _jsonrpc_result(req_id, _tool_error(
-                    f"This port now hosts pid {os.getpid()}, not {want_pid.strip()}; "
-                    "the instance changed. Rerun list_instances.")))
+                    "This worker port now hosts a different instance (it was recycled). "
+                    "Rerun list_instances.")))
                 return
 
         response = _handle_jsonrpc_request(payload, router=(role == "router"))
@@ -2400,10 +2409,12 @@ def _serve_in_thread(server: _MCPServer, name: str) -> threading.Thread:
 def _bind_worker(base: int) -> tuple[_MCPServer | None, int | None]:
     """Bind the first free worker port in the range (loopback only, exclusive)."""
     for port in range(base, base + WORKER_PORT_COUNT):
+        if port > 65535:
+            break
         try:
             server = _MCPServer((DEFAULT_HOST, port), MCPRequestHandler)
-        except OSError:
-            continue  # taken by another instance; try the next slot
+        except (OSError, OverflowError):
+            continue  # taken by another instance, or out of range; try the next slot
         server.role = "worker"
         return server, port
     return None, None
@@ -2429,10 +2440,13 @@ def _start_reclaim_loop() -> None:
     if _state.reclaim_thread is not None and _state.reclaim_thread.is_alive():
         return
 
+    stop_event = _state.stop_event  # capture this generation's event
+
     def _loop() -> None:
-        while not _state.stopping and _state.router_server is None:
-            time.sleep(RECLAIM_INTERVAL + random.uniform(0.0, RECLAIM_JITTER))
-            if _state.stopping or _state.router_server is not None:
+        # wait() returns True only when stop is signalled; on timeout it returns False -> retry.
+        # This wakes instantly on teardown, so stop_server can join without leaving a stale loop.
+        while not stop_event.wait(RECLAIM_INTERVAL + random.uniform(0.0, RECLAIM_JITTER)):
+            if _state.router_server is not None:
                 break
             if _try_become_router():
                 idaapi.msg("[IDA Fast MCP] Took over the unified endpoint "
@@ -2452,6 +2466,7 @@ def start_server() -> bool:
     _state.unified_host = _guarded_unified_host(host)
     _state.unified_port = port
     _state.stopping = False
+    _state.stop_event = threading.Event()  # fresh event for this run (old loops are joined below)
 
     # Every instance is reachable on its own loopback worker port (the full single-DB server).
     worker_server, worker_port = _bind_worker(port + 1)
@@ -2489,6 +2504,7 @@ def stop_server() -> None:
         return
 
     _state.stopping = True
+    _state.stop_event.set()  # wake the reclaim loop now so its join below returns promptly
 
     if _state.identity_timer is not None:
         with contextlib.suppress(Exception):

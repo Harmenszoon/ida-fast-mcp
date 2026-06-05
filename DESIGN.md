@@ -3,8 +3,8 @@
 ## What it is
 
 A single-file MCP server, embedded as an IDA Pro plugin, that gives an LLM agent a
-tight set of reverse-engineering tools over local HTTP. One user, one IDA instance,
-no dependencies.
+tight set of reverse-engineering tools over local HTTP. One user, one or more open IDA
+instances, no dependencies.
 
 ## Goals
 
@@ -20,8 +20,9 @@ no dependencies.
 IDA's API is single-threaded. Every tool runs on IDA's main thread via
 `ida_kernwin.execute_sync()`, which already serializes calls. So the server is a thin
 wrapper: HTTP request → validate → run on the main thread → JSON result. There is no
-queue, no worker pool, and no cache — none are needed, and each would only add state to
-get wrong. A genuinely long operation (e.g. decompiling a pathological function) blocks
+queue, no worker pool, and no cache of IDA results — none are needed, and each would only
+add state to get wrong. (The multi-instance router keeps one small thing: a ~1s cache of the
+instance-discovery scan.) A genuinely long operation (e.g. decompiling a pathological function) blocks
 until it finishes; that is inherent to the single-thread model. `run_python` adds a
 best-effort wall-clock deadline that interrupts runaway Python loops, but a single long
 native call still cannot be preempted.

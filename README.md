@@ -41,7 +41,7 @@ No dependencies. No environment setup.
 
 ## Execution model
 
-Every tool runs on IDA's main thread via `execute_sync()`, which already serializes all callers. There's no queue, worker pool, or cache to reason about — one request in, one JSON result out. A genuinely long operation (e.g. decompiling a pathological function) blocks until it finishes — inherent to IDA's single-threaded API. `run_python` additionally enforces a best-effort time limit that interrupts runaway Python loops.
+Every tool runs on IDA's main thread via `execute_sync()`, which already serializes all callers. There's no queue, no worker pool, and no cache of IDA results — one request in, one JSON result out. A genuinely long operation (e.g. decompiling a pathological function) blocks until it finishes — inherent to IDA's single-threaded API. `run_python` additionally enforces a best-effort time limit that interrupts runaway Python loops.
 
 Transport is `POST /mcp` (JSON-RPC 2.0, one request per HTTP call).
 
@@ -68,7 +68,7 @@ Transport is `POST /mcp` (JSON-RPC 2.0, one request per HTTP call).
 
 ## Multiple IDA instances
 
-Open as many IDA instances as you like — they coordinate automatically. The client still
+Open several IDA instances (up to 20) — they coordinate automatically. The client still
 connects to the single URL; nothing to configure per instance.
 
 - Call `list_instances` to see the open binaries (`name`, `path`, `pid`).
